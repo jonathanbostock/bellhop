@@ -43,14 +43,19 @@ from the live OpenAPI spec (v1.10.0, fetched 2026-08-26):
   launch-time race: out-of-stock launch is HTTP 400 with code
   `instance-operations/launch/insufficient-capacity`.
 - **Rate limits** (documented): 1 request/second generally, and 1 launch per
-  12 seconds. Polling sits at 10 s; consecutive launch attempts are spaced 12 s.
+  12 seconds. The pacer is *process-wide* (module-level monotonic timestamps —
+  not an `asyncio.Lock`, which would bind the first event loop), because a
+  `run_many()` fan-out launches from many `LambdaRest` clients concurrently
+  and per-client pacing would deterministically trip the limit. 429s are
+  retried with backoff on top. Polling sits at 10 s.
 - **SSH keys**: `GET/POST /ssh-keys`. We look for a registered key matching
-  the local public key (compare type+blob, ignore comment) and register it as
-  `bellhop-<sha256[:12]>` if absent.
+  the local public key (compare type+blob field-wise, ignore comment) and
+  register it as `bellhop-<sha256[:12]>` if absent; a lost registration race
+  (duplicate-name error) re-lists and matches instead of failing the launch.
 - **No TTL of any kind** (confirmed against the full OpenAPI spec): billing
   runs until terminate. `max_lifetime` is therefore a *client-side* watchdog
   (the `cluster.py` pattern) and the config warns that it does not survive
-  host death.
+  host death — see the cleanup story below.
 
 GPU vocabulary: instance types are named `gpu_<count>x_<model>[_<variant>]`
 (`gpu_1x_h100_pcie`, `gpu_8x_h100_sxm5`, `gpu_8x_a100_80gb_sxm4`, …).
@@ -58,7 +63,11 @@ GPU vocabulary: instance types are named `gpu_<count>x_<model>[_<variant>]`
 preference order; `gpu=` + `gpu_count=` expand to candidate type names, which
 are then filtered against the live catalog (so a candidate that doesn't exist
 at count N just drops out). `instance_type=` passes a verbatim name, like
-`gpu_id=` on RunPod.
+`gpu_id=` on RunPod. Two deliberate choices: **"A100" means 80GB variants
+only** (matching the RunPod alias — silently landing on 40GB cards OOMs jobs;
+`A100-40GB` is the explicit spelling), and **a pinned `region=` is attempted
+even when the catalog shows no capacity** — the capacity list is advisory and
+launch is the source of truth (the TOCTOU race cuts both ways).
 
 `/workspace` contract: the `ubuntu` user can't write `/`, so after readiness
 the backend runs `sudo mkdir -p /workspace && sudo chown ubuntu /workspace` —
@@ -86,14 +95,25 @@ ambient credentials (env token, service-account file, or CLI config).
   1-GPU and 8-GPU presets). `platform=`/`preset=` pass verbatim.
 - **SSH**: no default user on the images, root/admin are blocked — the login
   user is created by cloud-init (`users:` block with the local public key and
-  passwordless sudo, plus a `runcmd` that creates `/workspace` owned by that
-  user). Default user `ubuntu` to match Lambda muscle memory.
-- **Lifecycle**: Create returns an Operation; await it, then poll
-  `InstanceService.Get` until `RUNNING` and the public IP appears, then run
-  the readiness probe (covers the cloud-init tail). States: CREATING /
-  STARTING / RUNNING / STOPPING / STOPPED / DELETING / ERROR.
+  passwordless sudo). Default user `ubuntu` to match Lambda muscle memory.
+  `/workspace` is deliberately *not* made in cloud-init's `runcmd` — that
+  runs in the final phase, often 30–90 s after sshd starts accepting the key,
+  so the probe would pass before the dir existed. Both SSH backends instead
+  run the same post-ready `sudo mkdir -p /workspace && sudo chown …` step.
+- **Lifecycle**: Create returns an Operation whose `resource_id` is available
+  immediately; we skip `op.wait()` (broken/hung in some SDK versions —
+  pysdk#74) and go straight to polling `InstanceService.Get`. Fresh VMs
+  report **STOPPED with `reconciling=True`** on the way to STARTING →
+  RUNNING, so STOPPED alone is not failure — only ERROR/DELETING, or STOPPED
+  once reconciliation ends. The public IP comes back **CIDR-suffixed**
+  (`"1.2.3.4/32"`) and appears only once boot progresses. Every SDK call is
+  bounded with `wait_for` — bad credentials otherwise hang the SDK's
+  token-renew loop forever (dstack hit the same). The SDK is pinned `<0.7`
+  (pre-1.0 proto churn) with an import-surface canary test.
 - **No server-side TTL** (nothing in the InstanceSpec proto): same
-  client-side watchdog + warning as Lambda.
+  client-side watchdog + warning as Lambda. Teardown *retries* the delete —
+  a delete racing the create tail can be refused, and a swallowed refusal on
+  a TTL-less provider is a silent leak.
 - Image families: `ubuntu24.04-cuda12` for GPU boxes, `ubuntu24.04-driverless`
   for CPU (the 22.04 families were deprecated 2026-06-01). Drivers are baked
   in, so no install delay after SSH.
@@ -119,7 +139,16 @@ SSH backends; `HttpProbe(via_proxy=True)` remains RunPod-specific.
 | Nebius | yes | **none** — client watchdog only (warned) |
 
 Both new configs accept `max_lifetime=`; it arms an in-process watchdog task
-that terminates the box when it fires, and the config warns (once, at
-provision time) that a `kill -9` of the host leaves the box running — sweep
-with `bellhop lambda gc` / `bellhop nebius gc` (list+reap subcommands, the
-`bellhop clusters` pattern).
+that terminates the box when it fires. The watchdog is honest about its
+limits: it warns at provision time that a `kill -9` of the host leaves the
+box running, it warns again if `keep=True` disarms it at exit, it retries a
+failed teardown (then names the leaked box on stderr instead of
+bare-suppressing), and it sets `_lifetime_expired` so a mid-run kill surfaces
+as a clear "hit max_lifetime" error rather than a baffling ssh exit-255.
+
+The *real* backstop is the reaper. Every launch stamps `-t<epoch>` onto the
+box name (the Lambda Instance record has no created-at field; on Nebius one
+mechanism for both providers beats two), and `bellhop lambda|nebius gc
+--older-than-hours N [--dry-run]` terminates only bellhop-stamped boxes older
+than the threshold — a hand-made instance, or even a bellhop-named one
+without a parseable stamp, is never touched.

@@ -1,14 +1,20 @@
 # bellhop
 
-[![PyPI](https://img.shields.io/pypi/v/bellhop-py?color=blue)](https://pypi.org/project/bellhop-py/)
-[![Python](https://img.shields.io/pypi/pyversions/bellhop-py)](https://pypi.org/project/bellhop-py/)
-[![CI](https://github.com/dtch1997/arsenal/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/dtch1997/arsenal/actions/workflows/ci.yml)
+[![CI](https://github.com/jonathanbostock/bellhop/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/jonathanbostock/bellhop/actions/workflows/ci.yml)
+[![Python](https://img.shields.io/badge/python-3.10%2B-blue)](pyproject.toml)
 [![License: MIT](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
 
 **Run your code on a disposable cloud GPU — provision, execute, bring results
-back, tear down.** Async Python, two interchangeable backends:
-[RunPod](https://runpod.io) pods and [Modal](https://modal.com) sandboxes.
-Scales from one CPU box to a multi-node H200 cluster without changing shape.
+back, tear down.** Async Python, four interchangeable backends:
+[RunPod](https://runpod.io) pods, [Modal](https://modal.com) sandboxes,
+[Lambda Cloud](https://lambda.ai) instances and [Nebius](https://nebius.com)
+VMs. Scales from one CPU box to a multi-node H200 cluster without changing
+shape.
+
+> This is a fork of [dtch1997's bellhop](https://github.com/dtch1997/arsenal/tree/main/packages/bellhop)
+> that adds the **Lambda Cloud** and **Nebius** backends — providers with
+> fixed on-demand pricing and real capacity signals, for when RunPod's spot
+> market is the wrong trade.
 
 ```python
 from bellhop import pod, PodConfig
@@ -29,18 +35,30 @@ carries your luggage up, brings your bags back down, and checks out for you.
 **1. Install:**
 
 ```bash
-pip install bellhop-py           # RunPod backend
-pip install 'bellhop-py[modal]'  # + Modal backend
+pip install "git+https://github.com/jonathanbostock/bellhop"            # RunPod + Lambda backends
+pip install "bellhop-py[modal] @ git+https://github.com/jonathanbostock/bellhop"   # + Modal
+pip install "bellhop-py[nebius] @ git+https://github.com/jonathanbostock/bellhop"  # + Nebius
 ```
 
-(The PyPI name is `bellhop-py`; the import and CLI are plain `bellhop`.)
+(The distribution is `bellhop-py`; the import and CLI are plain `bellhop`.
+RunPod and Lambda need only httpx and ship in the core install; Modal and
+Nebius pull their provider SDKs, so they're extras.)
 
 **2. Authenticate:**
 
-- **RunPod**: `export RUNPOD_API_KEY=...`. Connections use your SSH keypair
-  (`~/.ssh/id_ed25519` by default — bellhop injects the public key into the
-  pod automatically).
+- **RunPod**: `export RUNPOD_API_KEY=...`.
+- **Lambda**: `export LAMBDA_API_KEY=...` (create one in the
+  [Lambda console](https://cloud.lambda.ai)).
 - **Modal**: `modal token new` (or `MODAL_TOKEN_ID`/`MODAL_TOKEN_SECRET`).
+- **Nebius**: ambient SDK auth — `NEBIUS_IAM_TOKEN`, a service-account
+  credentials file (`nebius iam auth-public-key generate`), or the `nebius`
+  CLI config — plus `export NEBIUS_PROJECT_ID=project-e00...` (the project's
+  region is where VMs land).
+
+The SSH backends (RunPod, Lambda, Nebius) connect with your SSH keypair
+(`~/.ssh/id_ed25519` by default): bellhop injects the public key into the box
+automatically — RunPod via pod env, Lambda via its key registry, Nebius via
+cloud-init.
 
 **3. Run something:**
 
@@ -55,15 +73,17 @@ res = asyncio.run(run(
 print(res.remote_exit, res.local_results)   # results pulled to ./experiments/demo/
 ```
 
-or from the shell:
+or from the shell — same flags, any backend:
 
 ```bash
 bellhop run --slug demo --codebase ./mycode --run "python go.py" --gpu A100
+bellhop run --backend lambda --slug demo --codebase ./mycode --run "python go.py" --gpu H100
+bellhop run --backend nebius --slug demo --codebase ./mycode --run "python go.py" --gpu H200 --gpu-count 8
 ```
 
-That one call provisions a pod, waits until it's genuinely reachable, uploads
+That one call provisions a box, waits until it's genuinely reachable, uploads
 `./mycode`, runs your command (logged to `results/run.log`), pulls the
-`results/` directory back, and deletes the pod — even if something fails
+`results/` directory back, and deletes the box — even if something fails
 midway.
 
 ## Which mode do I want?
@@ -71,13 +91,14 @@ midway.
 | You want to… | Use | Section |
 |---|---|---|
 | Run one job start-to-finish | `run()` / `bellhop run` | [One-shot jobs](#one-shot-jobs) |
-| Keep a box alive for several steps | `pod()` / `sandbox()` | [Interactive boxes](#interactive-boxes) |
+| Keep a box alive for several steps | `pod()` / `sandbox()` / `instance()` / `vm()` | [Interactive boxes](#interactive-boxes) |
 | Call a Python function remotely, get the return value | `box.call(fn, ...)` | [Remote function calls](#remote-function-calls) |
 | Fan out a parameter sweep | `run_many()` | [Sweeps](#sweeps) |
 | Train across multiple nodes (100B-scale) | `run_cluster()` | [Multi-node clusters](#multi-node-runpod-instant-clusters) |
 
-Everything takes either a `PodConfig` (RunPod) or a `ModalConfig` (Modal) —
-the pipelines are identical on both; see
+Everything takes a `PodConfig` (RunPod), `ModalConfig` (Modal),
+`LambdaConfig` (Lambda) or `NebiusConfig` (Nebius) — the pipelines are
+identical on all of them; see
 [Backends & configuration](#backends--configuration).
 
 ## One-shot jobs
@@ -108,15 +129,17 @@ Good to know:
 - If the job step times out (opt-in `timeout=`), bellhop still pulls whatever
   landed in `results/` before raising, so the run stays debuggable.
 - GCS upload happens from *your* machine — cloud credentials never touch the
-  pod. Needs `gcloud` on your PATH.
+  box. Needs `gcloud` on your PATH.
+- Jobs live under `/workspace/<slug>` on every backend — the SSH backends
+  bootstrap a user-owned `/workspace` before yielding the box.
 
-### Big data on the pod: pair with ferry
+### Big data on the box: pair with ferry
 
 bellhop's own transfer paths (codebase up, `results/` back) are tar-over-ssh
 through your machine — right for code and small results, wrong for weights.
-Bulk bytes should move **pod ↔ object store directly**; that's
-[ferry](../ferry)'s job (`pip install ferry-sync`), and the pairing is one
-line of env:
+Bulk bytes should move **box ↔ object store directly**; that's
+[ferry](https://github.com/dtch1997/arsenal/tree/main/packages/ferry)'s job
+(`pip install ferry-sync`), and the pairing is one line of env:
 
 ```python
 import ferry
@@ -133,13 +156,10 @@ RunSpec(
 ```
 
 `ferry.gcs_pod_env()` mints a ~1-hour access token from your local gcloud ADC
-and exposes it to the pod as an rclone remote named `gcs:` — consistent with
-the credo above: no long-lived credential ever touches the pod, and access
-self-expires. (For jobs longer than an hour that must *upload* at the end,
-use a scoped service-account key via `RunSpec(env=...)` instead.) Measured
-throughput and resume semantics are in ferry's README stress section;
-`packages/ferry/scripts/stress_pod.py` is the runnable proof of this exact
-pairing.
+and exposes it to the box as an rclone remote named `gcs:` — no long-lived
+credential ever touches the box, and access self-expires. (For jobs longer
+than an hour that must *upload* at the end, use a scoped service-account key
+via `RunSpec(env=...)` instead.)
 
 ## Interactive boxes
 
@@ -157,12 +177,19 @@ async with pod(PodConfig(gpu="RTX4090")) as p:
 # pod deleted here — even if the body raised (pass keep=True to leave it up)
 ```
 
-Same shape on Modal: `async with sandbox(ModalConfig(gpu="A10G")) as b:`.
+Same shape on every backend — only the config and the provider noun change:
 
-On RunPod, "ready" means more than the API saying RUNNING — sshd typically
-lags by 30–60 s, so bellhop polls a **readiness probe** before yielding the
-pod. The default (`SshProbe("true")`) suits ssh job pods; for servers use
-`HttpProbe(8000, "/health")` or `LogMarkerProbe("server up")`.
+```python
+async with sandbox(ModalConfig(gpu="A10G")) as b: ...       # Modal
+async with instance(LambdaConfig(gpu="H100")) as i: ...     # Lambda
+async with vm(NebiusConfig(gpu="H200", gpu_count=8)) as v: ...  # Nebius
+```
+
+"Ready" means more than the API saying running — sshd (RunPod) or cloud-init
+(Nebius) typically lags, so bellhop polls a **readiness probe** before
+yielding the box. The default (`SshProbe("true")`) suits ssh job boxes; for
+servers use `HttpProbe(8000, "/health")` or `LogMarkerProbe("server up")`.
+(Modal sandboxes are execable as soon as `create()` returns — no probe step.)
 
 ## Remote function calls
 
@@ -188,10 +215,12 @@ Rules of the road:
 
 - **Python minor versions must match** between your machine and the box's
   interpreter (3.12 ↔ 3.11 fails). The first `call()` pre-flights this and
-  raises `PreflightError` with the mismatch spelled out.
+  raises `PreflightError` with the mismatch spelled out. Know your box's
+  default `python3`: RunPod `pytorch-cuda` = 3.11, Lambda Stack (Ubuntu
+  22.04) = **3.10**, Nebius `ubuntu24.04-*` = 3.12. The escape hatch is
+  `call(..., python="python3.12")` after a `setup` that installs it.
 - **Dependencies go on the config** (`pip=[...]` — installed post-readiness on
-  RunPod, baked into the image on Modal). Pre-flight your pin set locally
-  (`uv pip compile`) before burning pod-hours on a conflict.
+  the SSH backends, baked into the image on Modal).
 - **Arguments/results travel by value** — fine for configs and metrics; ship
   large artifacts via GCS or a volume and pass paths.
 
@@ -208,7 +237,9 @@ results = await run_many(specs, PodConfig(gpu="A100"), max_concurrency=4)
 ```
 
 Each spec gets its own independent box; results/exceptions come back
-positionally.
+positionally. On Lambda, concurrent launches are automatically paced to the
+API's documented 1-launch-per-12s limit (process-wide), so a fan-out queues
+briefly instead of erroring.
 
 ## Multi-node: RunPod Instant Clusters
 
@@ -249,12 +280,8 @@ Cluster-specific behavior to know about:
   survivors would hang at the next collective) and raises `ClusterJobError`
   with per-rank results.
 - **Clusters have no server-side TTL** — teardown is the context manager plus
-  a client-side `max_lifetime` watchdog. Sweep up leaks with:
-
-  ```bash
-  bellhop clusters list
-  bellhop clusters gc --older-than-hours 24   # add --dry-run to preview
-  ```
+  a client-side `max_lifetime` watchdog. Sweep up leaks with
+  `bellhop clusters list` / `bellhop clusters gc --older-than-hours 24`.
 
 Supported shapes: H100/H200/B200 (3200 Gbps interconnect) and A100
 (1600 Gbps), 2–8 nodes. Full API contract and live-probe findings:
@@ -262,35 +289,41 @@ Supported shapes: H100/H200/B200 (3200 Gbps interconnect) and A100
 
 ## Backends & configuration
 
-Both backends implement the same contract (`exec` / `push` / `pull` /
+All four backends implement the same contract (`exec` / `push` / `pull` /
 `exists_remote` / `teardown`), so every pipeline above is provider-agnostic —
-hand it a `PodConfig` or a `ModalConfig`.
+hand it the config for the provider you want.
 
-Shared knobs, spelled the same on both:
+Shared knobs, spelled the same everywhere:
 
 | Knob | Meaning |
 |---|---|
-| `gpu=` | Canonical short name (`"A100"`, `"H100"`, `"L4"`, …) or a full RunPod id; `None` = CPU box. On RunPod an alias expands to *all* matching SKUs (PCIe + SXM), which improves stock availability. |
-| `max_lifetime=` | Hard server-side kill switch (`timedelta`) — see [Cleanup](#cleanup-how-boxes-die). |
-| `image=` / `image_preset=` | The `pytorch-cuda` preset is pinned to the same torch 2.4.0 + CUDA 12.4 environment on both backends. |
-| `pip=` | Extra packages (post-readiness install on RunPod; baked into the image on Modal). |
+| `gpu=` | Canonical short name (`"A100"`, `"H100"`, `"L4"`, …); `None` = CPU box (RunPod/Modal/Nebius — Lambda is GPU-only). Verbatim provider ids also pass: a RunPod gpuTypeId, a Lambda `gpu_8x_h100_sxm5`, a Nebius `gpu-h100-sxm`. `"A100"` means 80GB everywhere (say `A100-40GB` on Lambda for the cheap cards). |
+| `gpu_count=` | GPUs per box. Lambda: picks the `gpu_<n>x_*` type; Nebius: picks the preset (1 or 8 on SXM platforms). |
+| `max_lifetime=` | Hard kill switch (`timedelta`) — **server-side** on RunPod/Modal, **in-process watchdog only** on Lambda/Nebius; see [Cleanup](#cleanup-how-boxes-die). |
+| `pip=` | Extra packages (post-readiness install on the SSH backends; baked into the image on Modal). |
+| `ready=`, `provision_timeout=`, `ready_timeout=` | The readiness probe and its windows (defaults are boot-time-aware per backend — an 8× Lambda box gets 30 min where a RunPod pod gets 5). |
 
 What genuinely differs stays backend-specific:
 
-| | RunPod (`PodConfig`, `pod()`) | Modal (`ModalConfig`, `sandbox()`) |
-|---|---|---|
-| Readiness | SSH/probe wait | none — execable immediately |
-| Extra TTL | `stop_after` (wall-clock compute halt) | `idle_timeout` (kill after inactivity) |
-| Image extras | — | `apt=`, `modal.Image`, `secrets=`, `volumes=` |
-| Placement | `cloud=` SECURE/COMMUNITY (+auto fallback on stock-out) | `region=`, `cpu=`, `memory=` |
-| Auth | `RUNPOD_API_KEY` + SSH keypair | Modal token |
+| | RunPod (`PodConfig`, `pod()`) | Modal (`ModalConfig`, `sandbox()`) | Lambda (`LambdaConfig`, `instance()`) | Nebius (`NebiusConfig`, `vm()`) |
+|---|---|---|---|---|
+| Box | container pod, NAT'd ssh | Sandbox container | Ubuntu VM, `ubuntu@ip:22` | Ubuntu VM, `ubuntu@ip:22` |
+| Auth | `RUNPOD_API_KEY` | Modal token | `LAMBDA_API_KEY` | Nebius IAM (+ `NEBIUS_PROJECT_ID`) |
+| Placement | `cloud=` SECURE/COMMUNITY (+fallback) | `region=`, `cpu=`, `memory=` | `region=` (default: any with live capacity) | the project's region; `subnet_id=` |
+| Image | `image=`/`image_preset=` docker refs | `modal.Image`, `pip=`/`apt=`, `secrets=`, `volumes=` | Lambda Stack (or `image=` family/id) | `image_family=` (default cuda drivers), `disk_gb=` |
+| Server-side TTL | `stop_after`/`terminate_after` (GPU pods) | `timeout` (always enforced) | **none** | **none** |
+| Capacity signal | error prose on create | n/a (serverless) | live `regions_with_capacity_available` per type | "Not enough resources" on create |
+| Typical boot→ready | 30–60 s past RUNNING | instant | ~3–5 min (1×), 10–15 min (8×) | ~2–3 min + cloud-init |
+| Default `python3` | image's (preset: 3.11) | image's | 3.10 (Lambda Stack 22.04) | 3.12 (ubuntu 24.04) |
 
-Implementation notes: the RunPod backend talks to the REST API directly over
-`httpx` (GraphQL only where REST has no equivalent: native TTLs and Instant
-Clusters); no `runpodctl`, no vendored SDK. Transfers are tar-over-ssh
-(RunPod) / tar-over-exec (Modal) — images only need `tar`. Env vars passed to
-`exec(env=...)` are fed over stdin, never argv, so secrets don't show up in
-the box's process list.
+Implementation notes: the RunPod and Lambda backends talk to their REST APIs
+directly over `httpx` (RunPod GraphQL only where REST has no equivalent); the
+Nebius control plane is gRPC-only, so that backend uses the official `nebius`
+SDK (optional extra, lazily imported — like `modal`). Transfers are
+tar-over-ssh (SSH backends) / tar-over-exec (Modal) — images only need `tar`.
+Env vars passed to `exec(env=...)` are fed over stdin, never argv, so secrets
+don't show up in the box's process list. Lambda API calls are paced to the
+documented 1 req/s (and 1 launch/12 s) process-wide.
 
 ## Cleanup: how boxes die
 
@@ -299,27 +332,35 @@ Two independent layers:
 | When | Handled by |
 |------|------------|
 | Normal exit, exception, Ctrl-C | the `async with` / pipeline `finally` — **always** tears down (unless `keep=True`) |
-| Your process itself dies (kill -9, crash, reboot) | server-side safety timers |
+| Your process itself dies (kill -9, crash, reboot) | server-side safety timers — **where the provider has them** |
 
 The context manager is the primary guarantee; the timers cover the one case
-`finally` can't reach. On RunPod every GPU pod is created with
-`stop_after=24h` (halt billing, disk persists) and `terminate_after=72h`
-(delete) unless you change them; the backend-agnostic spelling
-`max_lifetime=timedelta(...)` maps to `terminate_after` on RunPod and
-`timeout` on Modal.
+`finally` can't reach. Per backend:
 
-Caveats worth knowing:
-
-- RunPod enforces its timers on a coarse schedule — treat them as an
-  hours-scale backstop, not a precise kill switch. They also apply to GPU
-  pods only (CPU pods rely on `finally`; bellhop warns when a CPU pod's TTL
-  is dropped).
-- Modal *always* enforces a sandbox lifetime (its own default is 300 s) —
+- **RunPod** GPU pods get `stop_after=24h` (halt billing, disk persists) and
+  `terminate_after=72h` (delete) unless you change them; enforcement is
+  coarse (hours-scale backstop, not a precise kill switch), and CPU pods get
+  no timer at all (bellhop warns).
+- **Modal** *always* enforces a sandbox lifetime (its own default is 300 s) —
   bellhop warns if you leave `timeout` unset.
-- Instant Clusters have **no** server-side timers at all — see
-  `bellhop clusters gc` above.
+- **Lambda and Nebius have NO server-side TTL of any kind** — billing runs
+  until the instance is terminated. `max_lifetime=` on those configs arms an
+  *in-process* watchdog: it terminates the box when it fires (a mid-run kill
+  surfaces as a clear "hit max_lifetime" error, not a mystery ssh failure),
+  but it dies with your process, and `keep=True` disarms it (bellhop warns
+  loudly in both cases). The real backstop is the reaper — bellhop stamps
+  every launch's name with `-t<epoch>` so leaks are findable:
+
+  ```bash
+  bellhop lambda list                                # everything, yours or not
+  bellhop lambda gc --older-than-hours 24 --dry-run  # preview the reap
+  bellhop nebius gc --older-than-hours 24            # stamped VMs only
+  ```
+
+  `gc` only ever touches bellhop-stamped boxes. Run it from cron if you run
+  unattended sweeps.
 - `exec()` (and the job step of `run()`) has **no client-side timeout by
-  default**: long training runs go until they finish or the box TTL fires. A
+  default**: long training runs go until they finish or the box dies. A
   *dead* connection is still detected promptly via SSH keepalives. Cap a
   specific command with `exec(..., timeout=7200)` /
   `RunSpec(..., timeout=7200)` / `--run-timeout-hours 2` — expiry raises
@@ -329,9 +370,9 @@ Caveats worth knowing:
 
 Branch on failure mode instead of parsing strings: `PreflightError` (bad
 config / missing key), `ProvisionError` (create failed — check
-`is_capacity_error(e)` for stock-outs), `PodNotReadyError`, `RemoteJobError`
-(`.remote_exit`, `.log_tail`), `ClusterJobError` (per-rank results),
-`ExecTimeoutError`, `RemoteCallError` (`.remote_traceback`),
+`is_capacity_error(e)` for stock-outs, on any provider), `PodNotReadyError`,
+`RemoteJobError` (`.remote_exit`, `.log_tail`), `ClusterJobError` (per-rank
+results), `ExecTimeoutError`, `RemoteCallError` (`.remote_traceback`),
 `ResultsMissingError`, `GcsUploadError`. All subclass `BellhopError`.
 
 ## Development
@@ -341,7 +382,12 @@ pip install -e ".[dev]"
 pytest                              # offline unit tests (no box, no cost)
 RUNPOD_LIVE=1 pytest tests/integration_live.py -s     # billed RunPod e2e
 MODAL_LIVE=1  pytest tests/integration_modal.py -s    # billed Modal e2e
+LAMBDA_LIVE=1 pytest tests/integration_lambda.py -s   # billed Lambda e2e
+NEBIUS_LIVE=1 pytest tests/integration_nebius.py -s   # billed Nebius e2e
 ```
+
+Design notes for the Lambda/Nebius backends (API contracts, quirks, cleanup
+model): [`docs/design/reliable-providers.md`](docs/design/reliable-providers.md).
 
 ## License
 

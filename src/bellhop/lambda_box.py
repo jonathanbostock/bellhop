@@ -110,21 +110,25 @@ def _api_key(explicit: str | None) -> str:
     return key
 
 
+# Pacing state is *module*-level so every client in the process shares one
+# budget (the documented limits are per account, and a sweep runs many
+# clients). Plain floats, no asyncio.Lock: a Lock would bind the first event
+# loop and break the next asyncio.run().
+_last_request = 0.0
+_last_launch = 0.0
+
+
 class LambdaRest:
     """Async client over the Lambda Cloud API. Use as an async context manager.
 
     Deliberately tiny, like :class:`bellhop.rest.RunpodRest` — just the verbs
-    the backend needs. Pacing state is *class*-level so every client in the
-    process shares one budget (the documented limits are per account, and a
-    sweep runs many clients).
+    the backend needs, plus pacing for the documented rate limits.
     """
 
     # Documented: "one request per second … /instance-operations/launch …
     # one request per 12 seconds". Class attributes so tests can zero them.
     min_request_interval = 1.0
     min_launch_interval = 12.0
-    _last_request = 0.0
-    _last_launch = 0.0
 
     def __init__(self, api_key: str | None = None, base: str = DEFAULT_BASE, timeout: float = 60.0):
         self.base = base.rstrip("/")
@@ -144,18 +148,18 @@ class LambdaRest:
         await self._client.aclose()
 
     async def _pace(self, *, launch: bool) -> None:
-        # No asyncio.Lock here: the check-and-set has no await between reading
-        # the clock and stamping it, so it's atomic within one event loop, and
-        # plain floats survive across asyncio.run() loops where a Lock can't.
+        # The check-and-set has no await between reading the clock and
+        # stamping it, so it's atomic within one event loop.
+        global _last_launch, _last_request
         while True:
             now = time.monotonic()
-            wait = LambdaRest._last_request + self.min_request_interval - now
+            wait = _last_request + self.min_request_interval - now
             if launch:
-                wait = max(wait, LambdaRest._last_launch + self.min_launch_interval - now)
+                wait = max(wait, _last_launch + self.min_launch_interval - now)
             if wait <= 0:
-                LambdaRest._last_request = now
+                _last_request = now
                 if launch:
-                    LambdaRest._last_launch = now
+                    _last_launch = now
                 return
             await asyncio.sleep(wait)
 
