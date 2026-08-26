@@ -316,14 +316,38 @@ async def ensure_workspace(box) -> None:
 
 
 async def install_pip(box, specs: list[str]) -> None:
-    """``config.pip`` deps-on-enter, shared by the SSH backends."""
+    """``config.pip`` deps-on-enter, shared by the SSH backends.
+
+    PIP_BREAK_SYSTEM_PACKAGES: Ubuntu 24.04 (the Nebius default images) marks
+    the system interpreter externally-managed (PEP 668) and plain ``pip
+    install`` refuses; the env var opts out (pip>=23), and older pips on the
+    RunPod/Lambda images ignore it. A disposable box has no system to protect.
+    """
     quoted = " ".join(shlex.quote(s) for s in specs)
-    r = await box.exec(f"python3 -m pip install -q {quoted}")
+    r = await box.exec(f"python3 -m pip install -q {quoted}",
+                       env={"PIP_BREAK_SYSTEM_PACKAGES": "1"})
     if r.exit_code != 0:
         raise ProvisionError(
             f"config.pip install failed on {box._noun} {box.id} "
             f"(rc={r.exit_code}): {(r.stderr or r.stdout)[-500:]}"
         )
+
+
+# The -t<epoch> name stamp shared by the TTL-less backends: how the gc
+# reapers know a box is bellhop's and how old it is. Names are forced to the
+# bellhop- prefix at stamp time, so every launch is reapable; anything not
+# matching this (hand-made boxes included) is never touched by gc.
+NAME_STAMP = re.compile(r"^bellhop.*-t(\d{9,12})$")
+
+
+def stamp_name(name: str) -> str:
+    prefix = name if name.startswith("bellhop") else f"bellhop-{name}"
+    return f"{prefix[:48]}-t{int(time.time())}"
+
+
+def stamp_epoch(name: str | None) -> int | None:
+    m = NAME_STAMP.match(name or "")
+    return int(m.group(1)) if m else None
 
 
 async def lifetime_watchdog(box, lifetime: timedelta) -> None:

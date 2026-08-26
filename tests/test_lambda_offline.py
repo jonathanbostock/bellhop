@@ -20,9 +20,9 @@ from bellhop.lambda_box import (
     _ensure_ssh_key,
     _launch,
     _pubkey_blob,
-    _stamp_epoch,
     gc_instances,
 )
+from bellhop.sshbox import stamp_epoch as _stamp_epoch
 
 
 @pytest.fixture(autouse=True)
@@ -303,6 +303,13 @@ def test_stamp_epoch_parse():
     assert _stamp_epoch("bellhop-demo-t1756219000") == 1756219000
     assert _stamp_epoch("bellhop-demo") is None          # unstamped: never reaped
     assert _stamp_epoch("someone-else-t1756219000") is None  # not ours: never reaped
+
+
+def test_launch_name_forced_reapable():
+    # a user-chosen name must not make the instance invisible to gc
+    body = LambdaConfig(gpu="H100", name="myexp").to_launch_body("t", "r", "k")
+    assert body["name"].startswith("bellhop-myexp")
+    assert _stamp_epoch(body["name"]) is not None
 
 
 def test_gc_reaps_only_stamped_and_old(monkeypatch):

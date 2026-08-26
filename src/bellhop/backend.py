@@ -47,14 +47,15 @@ class ExecResult:
 
 @runtime_checkable
 class ExecBox(Protocol):
-    """A live, execable ephemeral box. Both Pod and Sandbox satisfy this."""
+    """A live, execable ephemeral box. Pod, Sandbox, LambdaInstance and
+    NebiusVm all satisfy this."""
 
     id: str
 
     # timeout: optional *client-side* cap in seconds; None (default) means no
-    # client-side limit — the box's native server-side TTL (PodConfig
-    # stop_after/terminate_after/max_lifetime, ModalConfig timeout/max_lifetime)
-    # is the backstop. A finite timeout raises ExecTimeoutError when it expires.
+    # client-side limit — the box's TTL is the backstop (server-side on
+    # RunPod/Modal; the in-process max_lifetime watchdog on Lambda/Nebius).
+    # A finite timeout raises ExecTimeoutError when it expires.
     async def exec(self, cmd: str, env: dict[str, str] | None = None,
                    timeout: float | None = None) -> ExecResult: ...
 

@@ -423,3 +423,139 @@ def test_lambda_rest_pacing_shares_process_budget(monkeypatch):
 
     asyncio.run(go())
     assert sleeps and sleeps[0] > 90
+
+# --- open_box dispatch to the new backends ------------------------------------------
+
+def test_open_box_dispatches_lambda_and_nebius(monkeypatch):
+    import importlib
+
+    from bellhop import open_box
+
+    entered = []
+
+    def fake_cm(tag):
+        @contextlib.asynccontextmanager
+        async def cm(cfg, *, keep=False):
+            entered.append(tag)
+            yield tag
+
+        return cm
+
+    monkeypatch.setattr(importlib.import_module("bellhop.lambda_box"),
+                        "instance", fake_cm("lambda"))
+    monkeypatch.setattr(importlib.import_module("bellhop.nebius_box"),
+                        "vm", fake_cm("nebius"))
+
+    async def go(cfg):
+        async with open_box(cfg) as box:
+            return box
+
+    assert asyncio.run(go(LambdaConfig(gpu="H100"))) == "lambda"
+    assert asyncio.run(go(NebiusConfig(gpu="H100"))) == "nebius"
+    assert entered == ["lambda", "nebius"]
+
+
+# --- the TTL-less max_lifetime warning actually fires --------------------------------
+
+def test_lambda_max_lifetime_warns_watchdog_only(monkeypatch, keypair):
+    import importlib
+
+    from bellhop.lambda_box import instance
+
+    class _BoomRest:
+        def __init__(self, api_key=None):
+            pass
+
+        async def __aenter__(self):
+            raise RuntimeError("stop before any real API call")
+
+        async def __aexit__(self, *exc):
+            pass
+
+    monkeypatch.setattr(importlib.import_module("bellhop.lambda_box"),
+                        "LambdaRest", _BoomRest)
+
+    async def go():
+        async with instance(LambdaConfig(gpu="H100", ssh_key=keypair,
+                                         max_lifetime=timedelta(hours=1))):
+            pass
+
+    with pytest.warns(UserWarning, match="in-process watchdog only"):
+        with pytest.raises(RuntimeError, match="stop before"):
+            asyncio.run(go())
+
+
+# --- provision state machines (the advertised provider quirks) ----------------------
+
+def _drive_lambda(states_and_ips):
+    """Run LambdaInstance._wait_provision over a scripted status sequence."""
+    inst = LambdaInstance.__new__(LambdaInstance)
+    inst.id = "i-1"
+    inst.config = LambdaConfig(gpu="H100", provision_timeout=timedelta(seconds=5),
+                               poll_interval=0.0)
+    inst._meta = {}
+    seq = list(states_and_ips)
+
+    async def refresh():
+        inst._meta = seq.pop(0) if seq else inst._meta
+        return inst._meta
+
+    inst.refresh = refresh
+    return asyncio.run(inst._wait_provision())
+
+
+def test_lambda_provision_unhealthy_is_not_terminal():
+    # unhealthy can be a transient boot phase — only the timeout gives up on it
+    _drive_lambda([{"status": "booting"}, {"status": "unhealthy"},
+                   {"status": "active", "ip": "1.2.3.4"}])
+
+
+def test_lambda_provision_preempted_is_terminal():
+    with pytest.raises(ProvisionError, match="terminal state preempted"):
+        _drive_lambda([{"status": "booting"}, {"status": "preempted"}])
+
+
+def test_lambda_provision_waits_for_ip_not_just_active():
+    _drive_lambda([{"status": "active"},                      # ip lags "active"
+                   {"status": "active", "ip": "1.2.3.4"}])
+
+
+def test_nebius_provision_state_machine():
+    pytest.importorskip("nebius")
+    from bellhop.nebius_box import NebiusVm, _import_nebius
+
+    nb = _import_nebius()
+    S = nb.InstanceStatus.InstanceState
+
+    def drive(seq):
+        box = NebiusVm.__new__(NebiusVm)
+        box._nb = nb
+        box.id = "vm-1"
+        box.config = NebiusConfig(provision_timeout=timedelta(seconds=5),
+                                  poll_interval=0.0)
+        box._inst = None
+        steps = list(seq)
+
+        class _Nic:
+            class public_ip_address:
+                address = "1.2.3.4/32"
+
+        async def refresh():
+            state, reconciling, has_ip = steps.pop(0) if steps else steps_last[0]
+            steps_last[0] = (state, reconciling, has_ip)
+            box._inst = type("I", (), {"status": type("S", (), {
+                "state": state, "reconciling": reconciling,
+                "network_interfaces": [_Nic()] if has_ip else []})()})()
+
+        steps_last = [seq[-1]]
+        box.refresh = refresh
+        return asyncio.run(box._wait_provision())
+
+    # fresh VMs boot through STOPPED+reconciling — not a failure
+    drive([(S.STOPPED, True, False), (S.STARTING, True, False),
+           (S.RUNNING, False, True)])
+    # STOPPED with reconciliation over = settled = create failed upstream
+    with pytest.raises(ProvisionError, match="settled in STOPPED"):
+        drive([(S.STOPPED, True, False), (S.STOPPED, False, False)])
+    with pytest.raises(ProvisionError, match="terminal state ERROR"):
+        drive([(S.CREATING, True, False), (S.ERROR, False, False)])

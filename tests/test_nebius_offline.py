@@ -6,14 +6,15 @@ the `nebius` package is pre-1.0 and proto-generated, so if a version bump
 reshapes the API, these fail in dev/CI instead of at a user's provision time.
 """
 
-import re
 from dataclasses import replace
 from datetime import timedelta
 
 import pytest
 
 from bellhop import NebiusConfig, PreflightError
-from bellhop.nebius_box import _NAME_STAMP, _safe_name, _stamp_epoch
+from bellhop.nebius_box import _safe_name
+from bellhop.sshbox import NAME_STAMP as _NAME_STAMP
+from bellhop.sshbox import stamp_epoch as _stamp_epoch
 
 
 @pytest.fixture()
@@ -126,6 +127,12 @@ def test_stamped_name_parses_back():
 def test_stamped_name_bounds_length():
     name = NebiusConfig(name="bellhop-" + "x" * 100).stamped_name()
     assert len(name) <= 63 and _NAME_STAMP.match(name)
+
+
+def test_stamped_name_forced_reapable():
+    # a user-chosen name must not make the VM invisible to gc
+    name = NebiusConfig(name="My_Exp").stamped_name()
+    assert name.startswith("bellhop-my-exp") and _stamp_epoch(name) is not None
 
 
 # --- SDK import surface (the version-drift canary) ----------------------------------

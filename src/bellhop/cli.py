@@ -133,6 +133,7 @@ def _build_backend(args, env: dict):
             gpu=args.gpu,
             gpu_count=args.gpu_count,
             project_id=args.project_id,
+            image_family=args.image,   # --image means the image family here
             pip=list(args.pip or []),
             max_lifetime=max_lifetime,
             **ready_timeout,

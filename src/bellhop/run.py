@@ -23,6 +23,7 @@ from typing import TYPE_CHECKING
 
 from .backend import open_box
 from .errors import (
+    BellhopError,
     ExecTimeoutError,
     GcsUploadError,
     PreflightError,
@@ -177,6 +178,14 @@ async def run(spec: RunSpec, backend: "Backend", *, keep_pod: bool = False,
                 remote_exit = None
 
             if remote_exit not in (0, None):
+                if getattr(p, "_lifetime_expired", False):
+                    # The lifetime watchdog killed the box mid-job — exec just
+                    # sees ssh die (rc=255); name the real cause instead of
+                    # reporting a phantom job failure.
+                    raise BellhopError(
+                        f"box {p.id} hit max_lifetime mid-job — the job was "
+                        "killed by the lifetime watchdog, not by its own failure "
+                        f"(results salvage was attempted; check {local_out})")
                 _persist_failure(local_out, "job", remote_exit, job_res.stdout, job_res.stderr)
 
             # --- pull results ---

@@ -43,7 +43,8 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import hashlib
-import re
+import os
+import sys
 import time
 import warnings
 from dataclasses import dataclass, field
@@ -67,6 +68,8 @@ from .sshbox import (
     lifetime_watchdog,
     pubkey_text,
     resolve_ssh_key,
+    stamp_epoch,
+    stamp_name,
     wait_ready,
 )
 
@@ -96,14 +99,8 @@ _ALIAS_LOOKUP = {_canon_gpu(k): v for k, v in LAMBDA_GPU_ALIASES.items()}
 # Launch attempts are expensive (12s pacing each); bound the worst case.
 _MAX_LAUNCH_ATTEMPTS = 8
 
-# The -t<epoch> name stamp: how `gc_instances` knows an instance is ours and
-# how old it is (the Instance record carries no launch timestamp of its own).
-_NAME_STAMP = re.compile(r"^bellhop.*-t(\d{9,12})$")
-
 
 def _api_key(explicit: str | None) -> str:
-    import os
-
     key = explicit or os.environ.get("LAMBDA_API_KEY")
     if not key:
         raise PreflightError("LAMBDA_API_KEY not set (pass api_key= or export it)")
@@ -183,7 +180,7 @@ class LambdaRest:
         for attempt in range(4):
             await self._pace(launch=launch)
             resp = await self._client.request(method, path, json=json)
-            if resp.status_code != 429:
+            if resp.status_code != 429 or attempt == 3:
                 return resp
             # 429 despite pacing (shared account, other processes): back off.
             await asyncio.sleep(backoff)
@@ -303,9 +300,10 @@ class LambdaConfig:
             "region_name": region,
             "instance_type_name": instance_type,
             "ssh_key_names": [ssh_key_name],  # API: exactly one, pre-registered
-            # The -t<epoch> stamp is gc_instances's only age signal — the
-            # Instance record has no created-at field.
-            "name": f"{self.name[:48]}-t{int(time.time())}",
+            # The -t<epoch> stamp (bellhop- prefix forced) is gc_instances's
+            # ownership+age signal — the Instance record has no created-at
+            # field, and an unstamped launch would be invisible to the reaper.
+            "name": stamp_name(self.name),
         }
         if self.image:
             body["image"] = {"family": self.image} if isinstance(self.image, str) else dict(self.image)
@@ -378,7 +376,22 @@ class LambdaInstance(SshBox):
                          self.config.poll_interval)
 
     async def teardown(self) -> None:
-        await self._rest.terminate([self.id])
+        """Terminate the instance, retrying: a transient API failure swallowed
+        at teardown time on a TTL-less provider is a silent leak that bills
+        forever. The last failure names the instance so it can be reaped by
+        hand / `bellhop lambda gc`."""
+        last: Exception | None = None
+        for delay in (0, 10, 30):
+            if delay:
+                await asyncio.sleep(delay)
+            try:
+                await self._rest.terminate([self.id])
+                return
+            except Exception as e:
+                last = e
+        print(f"bellhop: could not terminate lambda instance {self.id} ({last}) — it is "
+              "still billing; reap with `bellhop lambda gc`", file=sys.stderr, flush=True)
+        raise last
 
     # ---- exec / transfer: inherited from SshBox ------------------------------
     def _ssh_endpoint(self) -> tuple[str, int]:
@@ -481,29 +494,50 @@ async def instance(config: LambdaConfig, *, keep: bool = False,
         ssh_key_name = await _ensure_ssh_key(rest, config)
         instance_id = await _launch(rest, config, ssh_key_name)
         inst = LambdaInstance(rest, instance_id, config)
+        # Armed the moment the id exists, not after readiness: billing starts
+        # at launch, and ensure_workspace/install_pip exec with no client
+        # timeout — on a TTL-less provider nothing else bounds a wedged
+        # bootstrap. max_lifetime is therefore measured from launch.
         watchdog: asyncio.Task | None = None
+        if config.max_lifetime:
+            watchdog = asyncio.create_task(lifetime_watchdog(inst, config.max_lifetime))
         try:
             await inst._wait_provision()
             await inst._wait_ready()
             await ensure_workspace(inst)
             if config.pip:
                 await install_pip(inst, config.pip)
-            if config.max_lifetime:
-                watchdog = asyncio.create_task(lifetime_watchdog(inst, config.max_lifetime))
             try:
                 yield inst
             except BaseException as e:
-                if inst._lifetime_expired:
+                if inst._lifetime_expired and not isinstance(e, asyncio.CancelledError):
                     # The watchdog killed the box mid-run; say so instead of
                     # letting the ssh exit-255 masquerade as a job failure.
+                    # (External cancellation stays a CancelledError.)
                     raise BellhopError(
                         f"instance {inst.id} hit max_lifetime "
                         f"{config.max_lifetime} mid-run and was terminated"
                     ) from e
                 raise
+            if inst._lifetime_expired:
+                # Post-kill execs return rc=255 rather than raising, so a body
+                # can "complete" against a dead box without tripping the
+                # except-path above — leave a loud trace either way.
+                warnings.warn(
+                    f"instance {inst.id} hit max_lifetime {config.max_lifetime} "
+                    "during the session — later commands ran against a dead box",
+                    stacklevel=3,
+                )
         finally:
             if watchdog:
-                watchdog.cancel()
+                if inst._lifetime_expired:
+                    # cancel() here could abort the terminate RPC mid-flight
+                    # (or its retry sleeps) and leak the box — let the bounded
+                    # watchdog finish instead.
+                    with contextlib.suppress(Exception):
+                        await watchdog
+                else:
+                    watchdog.cancel()
             if (keep or inst.keep) and config.max_lifetime and not inst._lifetime_expired:
                 warnings.warn(
                     f"keep=True disarms the max_lifetime watchdog: instance {inst.id} "
@@ -516,11 +550,6 @@ async def instance(config: LambdaConfig, *, keep: bool = False,
 
 
 # ---- leak reaping (no server-side TTL => leaks are on us to find) -----------
-
-def _stamp_epoch(name: str | None) -> int | None:
-    m = _NAME_STAMP.match(name or "")
-    return int(m.group(1)) if m else None
-
 
 async def list_instances(api_key: str | None = None) -> list[dict]:
     """All of the account's instances (bellhop-launched or not)."""
@@ -541,7 +570,7 @@ async def gc_instances(older_than: timedelta, *, dry_run: bool = False,
     reaped: list[dict] = []
     async with LambdaRest(api_key=api_key) as rest:
         for inst in await rest.list_instances():
-            epoch = _stamp_epoch(inst.get("name"))
+            epoch = stamp_epoch(inst.get("name"))
             if epoch is None or inst.get("status") in ("terminated", "terminating"):
                 continue
             age = now - epoch

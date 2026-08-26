@@ -67,6 +67,8 @@ from .sshbox import (
     lifetime_watchdog,
     pubkey_text,
     resolve_ssh_key,
+    stamp_epoch,
+    stamp_name,
     wait_ready,
 )
 
@@ -96,8 +98,6 @@ _PLATFORM_PRESETS: dict[str, dict[int, str]] = {
 
 DEFAULT_GPU_IMAGE_FAMILY = "ubuntu24.04-cuda12"     # drivers baked in
 DEFAULT_CPU_IMAGE_FAMILY = "ubuntu24.04-driverless"
-
-_NAME_STAMP = re.compile(r"^bellhop.*-t(\d{9,12})$")
 
 _RPC_TIMEOUT = 60.0
 
@@ -250,8 +250,9 @@ class NebiusConfig:
         )
 
     def stamped_name(self) -> str:
-        # The -t<epoch> stamp is gc_vms's ownership+age marker.
-        return f"{_safe_name(self.name)[:48]}-t{int(time.time())}"
+        # The -t<epoch> stamp (bellhop- prefix forced) is gc_vms's
+        # ownership+age marker; sanitized first for Nebius name rules.
+        return stamp_name(_safe_name(self.name))
 
 
 class NebiusVm(SshBox):
@@ -459,29 +460,48 @@ async def vm(config: NebiusConfig, *, keep: bool = False) -> AsyncIterator[Nebiu
         if not vm_id:
             raise ProvisionError(f"could not parse vm id from create operation: {op}")
         box = NebiusVm(sdk, nb, vm_id, config)
+        # Armed the moment the id exists — billing starts at create, and the
+        # bootstrap execs have no client timeout (see the Lambda backend for
+        # the full rationale). max_lifetime is measured from create.
         watchdog: asyncio.Task | None = None
+        if config.max_lifetime:
+            watchdog = asyncio.create_task(lifetime_watchdog(box, config.max_lifetime))
         try:
             await box._wait_provision()
             await box._wait_ready()
             await ensure_workspace(box)
             if config.pip:
                 await install_pip(box, config.pip)
-            if config.max_lifetime:
-                watchdog = asyncio.create_task(lifetime_watchdog(box, config.max_lifetime))
             try:
                 yield box
             except BaseException as e:
-                if box._lifetime_expired:
+                if box._lifetime_expired and not isinstance(e, asyncio.CancelledError):
                     # The watchdog killed the box mid-run; say so instead of
                     # letting the ssh exit-255 masquerade as a job failure.
+                    # (External cancellation stays a CancelledError.)
                     raise BellhopError(
                         f"vm {box.id} hit max_lifetime "
                         f"{config.max_lifetime} mid-run and was deleted"
                     ) from e
                 raise
+            if box._lifetime_expired:
+                # Post-kill execs return rc=255 rather than raising — leave a
+                # loud trace even when the body "completed".
+                warnings.warn(
+                    f"vm {box.id} hit max_lifetime {config.max_lifetime} "
+                    "during the session — later commands ran against a dead box",
+                    stacklevel=3,
+                )
         finally:
             if watchdog:
-                watchdog.cancel()
+                if box._lifetime_expired:
+                    # cancel() here could abort the delete mid-flight (or its
+                    # retry sleeps) and leak the box — let the bounded
+                    # watchdog finish instead.
+                    with contextlib.suppress(Exception):
+                        await watchdog
+                else:
+                    watchdog.cancel()
             if (keep or box.keep) and config.max_lifetime and not box._lifetime_expired:
                 warnings.warn(
                     f"keep=True disarms the max_lifetime watchdog: vm {box.id} "
@@ -497,11 +517,6 @@ async def vm(config: NebiusConfig, *, keep: bool = False) -> AsyncIterator[Nebiu
 
 
 # ---- leak reaping (no server-side TTL => leaks are on us to find) -----------
-
-def _stamp_epoch(name: str | None) -> int | None:
-    m = _NAME_STAMP.match(name or "")
-    return int(m.group(1)) if m else None
-
 
 async def list_vms(project_id: str | None = None,
                    credentials_file: str | None = None) -> list[dict]:
@@ -550,8 +565,9 @@ async def gc_vms(older_than: timedelta, *, dry_run: bool = False,
             "list_instances",
         )
         for inst in getattr(resp, "items", None) or []:
-            epoch = _stamp_epoch(inst.metadata.name)
-            if epoch is None:
+            epoch = stamp_epoch(inst.metadata.name)
+            state = getattr(getattr(inst, "status", None), "state", 0)
+            if epoch is None or int(state) == int(nb.InstanceStatus.InstanceState.DELETING):
                 continue
             age = now - epoch
             if age < older_than.total_seconds():

@@ -7,9 +7,9 @@ branch on failure mode instead of parsing exit codes:
     40 remote-job-failed, 41 exec-timeout, 42 remote-call-raised,
     50 results-missing, 60 gcs-upload-failed.
 
-The hierarchy is provider-agnostic (RunPod *and* Modal): ``ProvisionError`` is
-raised when either a pod or a sandbox fails to come up, ``RemoteJobError`` when
-the job exits non-zero on either, and so on.
+The hierarchy is provider-agnostic (RunPod, Modal, Lambda, Nebius):
+``ProvisionError`` is raised when any backend's box fails to come up,
+``RemoteJobError`` when the job exits non-zero on any of them, and so on.
 """
 
 from __future__ import annotations

@@ -123,7 +123,7 @@ ambient credentials (env token, service-account file, or CLI config).
 `Pod.exec/push/pull/exists_remote/_ssh_raw` moved verbatim into an `SshBox`
 base class; a backend supplies `_ssh_endpoint() -> (host, port)`, `ssh_user`,
 and the private-key path. `Pod` keeps its NAT-mapped endpoint and public
-surface unchanged; `LambdaInstance` / `NebiusInstance` are direct `ip:22`.
+surface unchanged; `LambdaInstance` / `NebiusVm` are direct `ip:22`.
 The probes (`SshProbe`, `TcpProbe`, `LogMarkerProbe`) already speak this
 interface (`_ssh_raw` / `host` / `mapped_port`), so they work on all three
 SSH backends; `HttpProbe(via_proxy=True)` remains RunPod-specific.
