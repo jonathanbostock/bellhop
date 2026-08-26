@@ -559,3 +559,90 @@ def test_nebius_provision_state_machine():
         drive([(S.STOPPED, True, False), (S.STOPPED, False, False)])
     with pytest.raises(ProvisionError, match="terminal state ERROR"):
         drive([(S.CREATING, True, False), (S.ERROR, False, False)])
+
+
+def test_lambda_launch_pacing_uses_12s_window(monkeypatch):
+    # the launch endpoint's dedicated 1-per-12s budget, distinct from the 1/s one
+    import time
+
+    import bellhop.lambda_box as lb
+
+    monkeypatch.setattr(LambdaRest, "min_request_interval", 1.0)
+    monkeypatch.setattr(LambdaRest, "min_launch_interval", 12.0)
+    now = time.monotonic()
+    monkeypatch.setattr(lb, "_last_request", now)
+    monkeypatch.setattr(lb, "_last_launch", now)
+    sleeps = []
+
+    async def fake_sleep(s):
+        sleeps.append(s)
+        monkeypatch.setattr(lb, "_last_launch", 0.0)
+        monkeypatch.setattr(lb, "_last_request", 0.0)
+
+    monkeypatch.setattr(asyncio, "sleep", fake_sleep)
+    asyncio.run(LambdaRest(api_key="k")._pace(launch=True))
+    assert sleeps and 10 < sleeps[0] <= 12   # waited the launch window, not the 1s one
+
+
+def test_nebius_gc_reaps_only_stamped_old_and_alive(monkeypatch):
+    import importlib
+    import time
+    from types import SimpleNamespace
+
+    nbmod = importlib.import_module("bellhop.nebius_box")
+    now = int(time.time())
+
+    def inst(id_, name, state):
+        return SimpleNamespace(metadata=SimpleNamespace(id=id_, name=name),
+                               status=SimpleNamespace(state=state))
+
+    items = [
+        inst("old", f"bellhop-x-t{now - 7200}", 1),
+        inst("new", f"bellhop-y-t{now - 60}", 1),
+        inst("keeper", "my-hand-made-vm", 1),
+        inst("dying", f"bellhop-z-t{now - 7200}", 8),   # already DELETING
+    ]
+    deleted = []
+
+    class FakeClient:
+        def __init__(self, sdk):
+            pass
+
+        async def list(self, req):
+            return SimpleNamespace(items=items)
+
+        async def delete(self, req):
+            deleted.append(req.id)
+
+    fake_nb = SimpleNamespace(
+        SDK=lambda **kw: SimpleNamespace(close=_noop_async),
+        InstanceServiceClient=FakeClient,
+        ListInstancesRequest=lambda **kw: SimpleNamespace(**kw),
+        DeleteInstanceRequest=lambda **kw: SimpleNamespace(**kw),
+        InstanceStatus=SimpleNamespace(InstanceState=_EnumLike()),
+    )
+    monkeypatch.setattr(nbmod, "_import_nebius", lambda: fake_nb)
+    monkeypatch.setenv("NEBIUS_PROJECT_ID", "project-e00x")
+
+    reaped = asyncio.run(nbmod.gc_vms(timedelta(hours=1)))
+    assert [r["id"] for r in reaped] == ["old"] and deleted == ["old"]
+    assert reaped[0]["age_hours"] >= 2.0
+
+
+async def _noop_async():
+    pass
+
+
+class _EnumLike:
+    """int-constructible stand-in for InstanceStatus.InstanceState."""
+
+    DELETING = 8
+
+    def __call__(self, v):
+        import enum
+
+        class S(enum.IntEnum):
+            RUNNING = 1
+            DELETING = 8
+
+        return S(int(v))
