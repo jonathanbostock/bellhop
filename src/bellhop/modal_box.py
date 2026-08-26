@@ -157,6 +157,10 @@ class Sandbox:
     it through the exact same calls it uses for a RunPod ``Pod``.
     """
 
+    # Mid-session escape hatch, same semantics as SshBox.keep: flip to True
+    # to convert this sandbox to keep=True (run()'s keep_on_failure uses it).
+    keep = False
+
     def __init__(self, sb, config: ModalConfig):
         self._sb = sb
         self.config = config
@@ -290,6 +294,6 @@ async def sandbox(config: ModalConfig, *, keep: bool = False) -> AsyncIterator[S
     try:
         yield box
     finally:
-        if not keep:
+        if not (keep or box.keep):
             with contextlib.suppress(Exception):
                 await box.teardown()

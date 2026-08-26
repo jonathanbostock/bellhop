@@ -8,20 +8,27 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
-import os
 import shlex
 import time
 import warnings
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
-from pathlib import Path
-from typing import AsyncIterator, Literal
+from typing import AsyncIterator, Awaitable, Callable, Literal
 
-from .backend import TAR_EXCLUDES, ExecResult
-from .errors import ExecTimeoutError, PodNotReadyError, PreflightError, ProvisionError
+from .errors import PodNotReadyError, PreflightError, ProvisionError
 from .graphql import RunpodGraphQL
 from .probes import ReadyProbe, SshProbe
 from .rest import RunpodRest
+from .sshbox import (
+    SSH_OPTS,
+    SshBox,
+    install_pip,
+    pubkey_text,
+    resolve_ssh_key,
+    wait_ready,
+)
+
+__all__ = ["GPU_ALIASES", "IMAGE_PRESETS", "Pod", "PodConfig", "SSH_OPTS", "pod"]
 
 
 def _iso(dt: datetime) -> str:
@@ -65,14 +72,6 @@ _ALIAS_LOOKUP = {_canon_gpu(k): v for k, v in GPU_ALIASES.items()}
 DEFAULT_GPU_IMAGE = IMAGE_PRESETS["pytorch-cuda"]
 DEFAULT_CPU_IMAGE = IMAGE_PRESETS["cpu-base"]
 
-SSH_OPTS = [
-    "-o", "StrictHostKeyChecking=no",
-    "-o", "UserKnownHostsFile=/dev/null",
-    "-o", "LogLevel=ERROR",
-    "-o", "ConnectTimeout=10",
-    "-o", "ServerAliveInterval=30",
-]
-
 
 @dataclass
 class PodConfig:
@@ -112,6 +111,19 @@ class PodConfig:
     # auth / connection
     ssh_key: str | None = None             # private key; default ~/.ssh/id_ed25519
     ssh_user: str = "root"
+    # Host-quality floors (GraphQL create path, GPU pods only). RunPod
+    # schedules onto any host satisfying the GPU ask; a 110B FSDP run that
+    # needs 1.9TB host RAM can land on a 512GB machine without these.
+    min_memory_gb: int | None = None       # GraphQL minMemoryInGb
+    min_vcpu: int | None = None            # GraphQL minVcpuCount
+    # Post-readiness host acceptance check: async callable(pod) -> None that
+    # RAISES to reject this host — the pod is torn down and provisioning
+    # rerolls (up to host_check_retries). The pod is functional when called,
+    # so checks can exec: IP blocklists, upload-bandwidth probes (a host with
+    # fine download and a broken 6MB/s upload passes every download test and
+    # then fails your checkpoint publish), nvme smoke tests, ...
+    host_check: "Callable[[Pod], Awaitable[None]] | None" = None
+    host_check_retries: int = 3
     # readiness. Defaults resolve in __post_init__: 300s/420s normally, but
     # 1200s each when docker_start_cmd is set — a bootstrap that apt-installs
     # its way to sshd routinely needs 5-15 min before the pod is reachable,
@@ -178,16 +190,10 @@ class PodConfig:
         return DEFAULT_GPU_IMAGE if self.resolved_compute == "gpu" else DEFAULT_CPU_IMAGE
 
     def resolve_ssh_key(self) -> str:
-        key = self.ssh_key or os.path.expanduser("~/.ssh/id_ed25519")
-        if not Path(key).exists():
-            raise PreflightError(f"ssh private key not found: {key}")
-        return key
+        return resolve_ssh_key(self.ssh_key)
 
     def pubkey_text(self) -> str:
-        pub = self.resolve_ssh_key() + ".pub"
-        if not Path(pub).exists():
-            raise PreflightError(f"ssh public key not found: {pub}")
-        return Path(pub).read_text().strip()
+        return pubkey_text(self.ssh_key)
 
     def to_create_body(self) -> dict:
         env = dict(self.env)
@@ -217,6 +223,14 @@ class PodConfig:
     def has_ttl(self) -> bool:
         return bool(self.stop_after or self.terminate_after)
 
+    def has_host_floor(self) -> bool:
+        return bool(self.min_memory_gb or self.min_vcpu)
+
+    def needs_graphql(self) -> bool:
+        """REST v1 has neither TTL nor host-floor fields; either routes create
+        through GraphQL (which handles both, TTL or not)."""
+        return self.has_ttl() or self.has_host_floor()
+
     def to_graphql_input(self, gpu_type_id: str | None = None) -> dict:
         """Input for podFindAndDeployOnDemand — the only create path with TTL.
 
@@ -243,6 +257,10 @@ class PodConfig:
             inp["dockerArgs"] = f"bash -c {shlex.quote(self.docker_start_cmd)}"
         if self.cuda_versions:
             inp["allowedCudaVersions"] = list(self.cuda_versions)
+        if self.min_memory_gb:
+            inp["minMemoryInGb"] = self.min_memory_gb
+        if self.min_vcpu:
+            inp["minVcpuCount"] = self.min_vcpu
         if self.volume_gb:
             inp["volumeInGb"] = self.volume_gb
             inp["volumeMountPath"] = self.volume_mount_path
@@ -254,8 +272,15 @@ class PodConfig:
         return inp
 
 
-class Pod:
-    """A live pod. Construct via :func:`pod` (the async context manager)."""
+class Pod(SshBox):
+    """A live pod. Construct via :func:`pod` (the async context manager).
+
+    Transport (exec / push / pull / probes) comes from :class:`SshBox`; this
+    class adds the RunPod-specific halves: REST lifecycle and the NAT-mapped
+    SSH endpoint.
+    """
+
+    _noun = "pod"
 
     def __init__(self, rest: RunpodRest, pod_id: str, config: PodConfig):
         self._rest = rest
@@ -263,6 +288,10 @@ class Pod:
         self.config = config
         self._meta: dict = {}
         self._ssh_key = config.resolve_ssh_key()
+
+    @property
+    def ssh_user(self) -> str:
+        return self.config.ssh_user
 
     # ---- connection info ---------------------------------------------------
     @property
@@ -300,128 +329,18 @@ class Pod:
             await asyncio.sleep(self.config.poll_interval)
 
     async def _wait_ready(self) -> None:
-        deadline = time.monotonic() + self.config.ready_timeout.total_seconds()
-        while True:
-            try:
-                ok = await self.config.ready(self)
-            except Exception:
-                ok = False  # a raising probe = not ready yet (see probes.py)
-            if ok:
-                return
-            if time.monotonic() >= deadline:
-                raise PodNotReadyError(
-                    f"pod {self.id} provisioned but readiness probe never passed "
-                    f"within {self.config.ready_timeout.total_seconds():.0f}s"
-                )
-            await asyncio.sleep(self.config.poll_interval)
+        await wait_ready(self, self.config.ready, self.config.ready_timeout,
+                         self.config.poll_interval)
 
     async def teardown(self) -> None:
         await self._rest.delete_pod(self.id)
 
-    # ---- exec / transfer ---------------------------------------------------
-    def _ssh_argv(self) -> list[str]:
+    # ---- exec / transfer: inherited from SshBox ------------------------------
+    def _ssh_endpoint(self) -> tuple[str, int]:
         port = self.mapped_port(22)
         if not (self.host and port):
             raise PodNotReadyError("ssh endpoint not available yet")
-        return ["ssh", "-i", self._ssh_key, *SSH_OPTS, "-p", str(port),
-                f"{self.config.ssh_user}@{self.host}"]
-
-    def _ssh_prefix(self) -> str:
-        return " ".join(shlex.quote(a) for a in self._ssh_argv())
-
-    async def _ssh_raw(self, cmd: str, timeout: float = 600) -> ExecResult:
-        """Run a single command over ssh (no readiness gating)."""
-        proc = await asyncio.create_subprocess_exec(
-            *self._ssh_argv(), cmd,
-            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
-        )
-        out, err = await _communicate(proc, timeout=timeout)
-        return ExecResult(proc.returncode or 0, out, err)
-
-    async def exec(self, cmd: str, env: dict[str, str] | None = None,
-                   timeout: float | None = None) -> ExecResult:
-        """Run command(s) on the pod.
-
-        No client-side timeout by default: a long training job runs until the
-        pod's own TTL (``stop_after``/``terminate_after``/``max_lifetime``)
-        kills it, and a *dead* connection is caught by ssh's ServerAlive
-        keepalive rather than a wall-clock guess. Pass a finite ``timeout``
-        (seconds) to cap this one command — it raises :class:`ExecTimeoutError`
-        on expiry (the remote process may keep running on the pod).
-
-        Env vars are exported *inside* the script (a fresh sshd session does not
-        inherit the container's PID-1 env), and the whole script is fed over
-        stdin to ``bash -ls`` so secret values never appear in the pod's argv.
-        """
-        exports = "\n".join(f"export {k}={shlex.quote(v)}" for k, v in (env or {}).items())
-        script = f"set -o pipefail\n{exports}\n{cmd}\n"
-        proc = await asyncio.create_subprocess_exec(
-            *self._ssh_argv(), "bash", "-ls",
-            stdin=asyncio.subprocess.PIPE,
-            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
-        )
-        try:
-            out, err = await _communicate(proc, stdin=script.encode(), timeout=timeout)
-        except asyncio.TimeoutError:
-            head = cmd.strip().splitlines()[0][:120] if cmd.strip() else cmd
-            raise ExecTimeoutError(
-                f"exec timed out after {timeout:.0f}s on pod {self.id}: {head}") from None
-        return ExecResult(proc.returncode or 0, out, err)
-
-    async def push(self, local: str | Path, remote: str) -> None:
-        """Upload a local directory to ``remote`` on the pod (tar-over-ssh)."""
-        local = str(local)
-        if not Path(local).is_dir():
-            raise PreflightError(f"push source not a directory: {local}")
-        excl = " ".join(TAR_EXCLUDES)
-        remote_cmd = f"mkdir -p {shlex.quote(remote)} && tar xzf - -C {shlex.quote(remote)}"
-        pipeline = (
-            f"tar czf - -C {shlex.quote(local)} {excl} . "
-            f"| {self._ssh_prefix()} {shlex.quote(remote_cmd)}"
-        )
-        await _run_shell(pipeline, what="push")
-
-    async def pull(self, remote: str, local_dest: str | Path) -> None:
-        """Download remote dir into ``local_dest`` (creates local_dest/<basename>)."""
-        local_dest = str(local_dest)
-        Path(local_dest).mkdir(parents=True, exist_ok=True)
-        parent = os.path.dirname(remote.rstrip("/")) or "/"
-        base = os.path.basename(remote.rstrip("/"))
-        remote_cmd = f"tar czf - -C {shlex.quote(parent)} {shlex.quote(base)}"
-        pipeline = (
-            f"{self._ssh_prefix()} {shlex.quote(remote_cmd)} "
-            f"| tar xzf - -C {shlex.quote(local_dest)}"
-        )
-        await _run_shell(pipeline, what="pull")
-
-    async def exists_remote(self, path: str) -> bool:
-        res = await self._ssh_raw(f"test -e {shlex.quote(path)}")
-        return res.exit_code == 0
-
-    async def call(self, fn, *args, **kwargs):
-        """Run a local Python function on the pod; see :func:`bellhop.call.call`."""
-        from .call import call as _call
-        return await _call(self, fn, *args, **kwargs)
-
-
-async def _communicate(proc, stdin: bytes | None = None, timeout: float = 600):
-    try:
-        out, err = await asyncio.wait_for(proc.communicate(stdin), timeout=timeout)
-    except asyncio.TimeoutError:
-        with contextlib.suppress(ProcessLookupError):
-            proc.kill()
-        await proc.wait()
-        raise
-    return out.decode("utf-8", "replace"), err.decode("utf-8", "replace")
-
-
-async def _run_shell(pipeline: str, what: str) -> None:
-    proc = await asyncio.create_subprocess_shell(
-        pipeline, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
-    )
-    out, err = await proc.communicate()
-    if proc.returncode != 0:
-        raise RuntimeError(f"{what} failed (rc={proc.returncode}): {err.decode('utf-8','replace')[:500]}")
+        return self.host, port
 
 
 async def _gql_create(config: PodConfig, api_key: str | None) -> dict:
@@ -453,59 +372,88 @@ async def _gql_create(config: PodConfig, api_key: str | None) -> dict:
         )
 
 
+async def _create(rest: RunpodRest, config: PodConfig, api_key: str | None) -> str:
+    """One create call (GraphQL or REST as the config demands) -> pod id."""
+    if config.needs_graphql() and config.resolved_compute == "gpu":
+        # Native server-side TTL and the host floors are GraphQL-only
+        # (and on-demand = GPU only).
+        created = await _gql_create(config, api_key)
+    else:
+        if config.has_ttl():
+            warnings.warn(
+                "server-side TTL (stop_after/terminate_after/max_lifetime) is "
+                "GPU-only on RunPod; this CPU pod gets NO native timer — if this "
+                "process dies, nothing tears the pod down",
+                stacklevel=2,
+            )
+        if config.has_host_floor():
+            warnings.warn(
+                "min_memory_gb/min_vcpu are GPU-only on RunPod (GraphQL create "
+                "path); this CPU pod's host floors are dropped",
+                stacklevel=2,
+            )
+        body = config.to_create_body()
+        try:
+            created = await rest.create_pod(body)
+        except ProvisionError as first:
+            if config.cloud == "COMMUNITY" and config.cloud_fallback:
+                body["cloudType"] = "SECURE"
+                try:
+                    created = await rest.create_pod(body)
+                except ProvisionError as second:
+                    raise ProvisionError(
+                        f"create failed on COMMUNITY ({first}) "
+                        f"and on the SECURE fallback ({second})"
+                    ) from second
+            else:
+                raise
+    pod_id = created.get("id") or created.get("pod", {}).get("id")
+    if not pod_id:
+        raise ProvisionError(f"could not parse pod id from create response: {created}")
+    return pod_id
+
+
 @contextlib.asynccontextmanager
 async def pod(config: PodConfig, *, keep: bool = False,
               api_key: str | None = None) -> AsyncIterator[Pod]:
     """Provision a pod, wait until it's functional, yield it, tear it down.
 
     On any exception (including a readiness timeout) the pod is still deleted,
-    unless ``keep=True``.
+    unless ``keep=True`` — or unless the body set ``p.keep = True``, the
+    mid-session escape hatch (run() uses it for ``keep_on_failure``).
+
+    With ``config.host_check`` set, a rejected host (the check raising) tears
+    that pod down — regardless of ``keep`` — and re-provisions, up to
+    ``host_check_retries`` rerolls: RunPod happily re-serves known-bad hosts,
+    so "reject and reroll" is the only lever a client has.
     """
     async with RunpodRest(api_key=api_key) as rest:
-        if config.has_ttl() and config.resolved_compute == "gpu":
-            # Native server-side TTL is GraphQL-only (and on-demand = GPU only).
-            created = await _gql_create(config, api_key)
-        else:
-            if config.has_ttl():
-                warnings.warn(
-                    "server-side TTL (stop_after/terminate_after/max_lifetime) is "
-                    "GPU-only on RunPod; this CPU pod gets NO native timer — if this "
-                    "process dies, nothing tears the pod down",
-                    stacklevel=2,
-                )
-            body = config.to_create_body()
+        rerolls = config.host_check_retries if config.host_check else 0
+        rejections: list[str] = []
+        for attempt in range(rerolls + 1):
+            p = Pod(rest, await _create(rest, config, api_key), config)
             try:
-                created = await rest.create_pod(body)
-            except ProvisionError as first:
-                if config.cloud == "COMMUNITY" and config.cloud_fallback:
-                    body["cloudType"] = "SECURE"
+                await p._wait_provision()
+                await p._wait_ready()
+                if config.host_check:
                     try:
-                        created = await rest.create_pod(body)
-                    except ProvisionError as second:
+                        await config.host_check(p)
+                    except Exception as e:
+                        rejections.append(f"pod {p.id} on {p.host}: {e}")
+                        # a rejected host is torn down even under keep=True —
+                        # nobody wants to keep the pod they just rejected
+                        with contextlib.suppress(Exception):
+                            await p.teardown()
+                        if attempt < rerolls:
+                            continue
                         raise ProvisionError(
-                            f"create failed on COMMUNITY ({first}) "
-                            f"and on the SECURE fallback ({second})"
-                        ) from second
-                else:
-                    raise
-        pod_id = created.get("id") or created.get("pod", {}).get("id")
-        if not pod_id:
-            raise ProvisionError(f"could not parse pod id from create response: {created}")
-
-        p = Pod(rest, pod_id, config)
-        try:
-            await p._wait_provision()
-            await p._wait_ready()
-            if config.pip:
-                specs = " ".join(shlex.quote(s) for s in config.pip)
-                r = await p.exec(f"python3 -m pip install -q {specs}")
-                if r.exit_code != 0:
-                    raise ProvisionError(
-                        f"config.pip install failed on pod {pod_id} "
-                        f"(rc={r.exit_code}): {(r.stderr or r.stdout)[-500:]}"
-                    )
-            yield p
-        finally:
-            if not keep:
-                with contextlib.suppress(Exception):
-                    await p.teardown()
+                            f"host_check rejected every host ({rerolls + 1} attempts):\n  "
+                            + "\n  ".join(rejections))
+                if config.pip:
+                    await install_pip(p, config.pip)
+                yield p
+                return
+            finally:
+                if not (keep or p.keep):
+                    with contextlib.suppress(Exception):
+                        await p.teardown()

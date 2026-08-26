@@ -3,22 +3,27 @@
 create -> wait-functional -> upload codebase -> setup+run (tee'd) -> pull
 results -> upload to GCS -> teardown -> structured RunResult.
 
-Backend-agnostic: hand it a ``PodConfig`` (RunPod) or a ``ModalConfig`` (Modal)
-and the pipeline runs identically — the only provider-specific work happens
-behind :func:`bellhop.backend.open_box`.
+Backend-agnostic: hand it a ``PodConfig`` (RunPod), ``ModalConfig`` (Modal),
+``LambdaConfig`` (Lambda Cloud) or ``NebiusConfig`` (Nebius) and the pipeline
+runs identically — the only provider-specific work happens behind
+:func:`bellhop.backend.open_box`. (Every backend guarantees a writable
+``/workspace``, so the ``/workspace/<slug>`` layout is uniform.)
 """
 
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import os
 import shlex
+import sys
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import TYPE_CHECKING
 
 from .backend import open_box
 from .errors import (
+    BellhopError,
     ExecTimeoutError,
     GcsUploadError,
     PreflightError,
@@ -27,10 +32,12 @@ from .errors import (
 )
 
 if TYPE_CHECKING:
+    from .lambda_box import LambdaConfig
     from .modal_box import ModalConfig
+    from .nebius_box import NebiusConfig
     from .pod import PodConfig
 
-    Backend = PodConfig | ModalConfig
+    Backend = PodConfig | ModalConfig | LambdaConfig | NebiusConfig
 
 # GCS upload is opt-in: pass gcs_base="gs://your-bucket/prefix" (or --gcs-base) to enable.
 DEFAULT_GCS_BASE = None
@@ -66,6 +73,22 @@ def _is_git(codebase: str) -> bool:
     return codebase.startswith(("http://", "https://", "git@"))
 
 
+def _persist_failure(local_out: str, what: str, exit_code: int | None,
+                     stdout: str, stderr: str) -> None:
+    """Write a failing step's FULL output to <local_out>/failure.log.
+
+    RemoteJobError.log_tail is 2000 chars and lives only in the exception —
+    one caller forgetting to print it and the fatal error string is gone
+    forever. The full text on disk survives any amount of caller sloppiness.
+    """
+    with contextlib.suppress(Exception):
+        Path(local_out, "failure.log").write_text(
+            f"--- {what} (exit={exit_code}) ---\n"
+            f"----- stdout -----\n{stdout}\n----- stderr -----\n{stderr}\n",
+            encoding="utf-8",
+        )
+
+
 def _job_script(spec: RunSpec, run_dir: str) -> str:
     """The setup+run script, tee'd to run.log.
 
@@ -82,20 +105,27 @@ def _job_script(spec: RunSpec, run_dir: str) -> str:
     )
 
 
-async def _checked_exec(box, cmd: str, what: str) -> None:
+async def _checked_exec(box, cmd: str, what: str, local_out: str) -> None:
     r = await box.exec(cmd)
     if r.exit_code != 0:
-        raise RemoteJobError(f"{what} failed", remote_exit=r.exit_code,
-                             log_tail=r.stderr[-2000:])
+        _persist_failure(local_out, what, r.exit_code, r.stdout, r.stderr)
+        raise RemoteJobError(f"{what} failed (full output: {local_out}/failure.log)",
+                             remote_exit=r.exit_code, log_tail=r.stderr[-2000:])
 
 
 async def run(spec: RunSpec, backend: "Backend", *, keep_pod: bool = False,
-              api_key: str | None = None) -> RunResult:
-    """Run ``spec`` on the box implied by ``backend`` (PodConfig or ModalConfig).
+              keep_on_failure: bool = False, api_key: str | None = None) -> RunResult:
+    """Run ``spec`` on the box implied by ``backend``'s config type.
 
     ``keep_pod`` leaves the box up after the run (kept for name compatibility;
-    applies to a Modal sandbox too). ``api_key`` is the RunPod key and is ignored
-    by the Modal backend (Modal uses its own ambient auth).
+    applies to every backend — NB on Lambda/Nebius a kept box has NO server-side
+    TTL). ``keep_on_failure`` is the failure-aware version: the box is torn
+    down on success but left up when the job step fails, times out, or the
+    results pull dies — the state it holds (a 14h checkpoint the size of a
+    small moon) is usually worth more than the hourly rate; the box id is
+    printed so you can reconnect or tear it down. Provision-rejected boxes are
+    still cleaned up. ``api_key`` is the RunPod key and is ignored by the
+    other backends (they use their own ambient auth).
     """
     if not (spec.slug and spec.codebase and spec.run):
         raise PreflightError("slug, codebase and run are all required")
@@ -111,40 +141,75 @@ async def run(spec: RunSpec, backend: "Backend", *, keep_pod: bool = False,
     backend = replace(backend, name=f"bellhop-{spec.slug}")
 
     async with open_box(backend, keep=keep_pod, api_key=api_key) as p:
-        # --- upload codebase (mkdir -p the parent so both git-clone and push
-        # work even when /workspace doesn't pre-exist, e.g. on a Modal image) ---
-        await _checked_exec(p, f"mkdir -p {shlex.quote(os.path.dirname(run_dir))}",
-                            "workspace setup (mkdir)")
-        if _is_git(spec.codebase):
-            r = await p.exec(f"git clone --depth 1 {shlex.quote(spec.codebase)} {shlex.quote(run_dir)}")
-            if r.exit_code != 0:
-                raise RemoteJobError("git clone failed", remote_exit=r.exit_code, log_tail=r.stderr[-2000:])
-        else:
-            await _checked_exec(p, f"mkdir -p {shlex.quote(run_dir)}",
-                                "workspace setup (mkdir)")
-            await p.push(spec.codebase, run_dir)
+        # If a max_lifetime watchdog fires (Lambda/Nebius), salvage the results
+        # dir before the box is destroyed — losing a run to its own safety
+        # timer during the results phase is the worst possible trade.
+        async def _salvage():
+            if await p.exists_remote(results_remote):
+                await p.pull(results_remote, local_out)
+        p.on_lifetime_expiry = _salvage
 
-        # --- run (setup then job), tee'd to a log that travels back ---
-        timed_out: ExecTimeoutError | None = None
         try:
-            job_res = await p.exec(_job_script(spec, run_dir), env=spec.env,
-                                   timeout=spec.timeout)
-            remote_exit = job_res.exit_code
-        except ExecTimeoutError as e:
-            # Still try to salvage whatever the job wrote before re-raising —
-            # partial results + run.log are exactly what you want after a
-            # timeout, and the box is torn down on exit either way.
-            timed_out = e
-            remote_exit = None
+            # --- upload codebase (mkdir -p the parent so both git-clone and push
+            # work even when /workspace doesn't pre-exist, e.g. on a Modal image) ---
+            await _checked_exec(p, f"mkdir -p {shlex.quote(os.path.dirname(run_dir))}",
+                                "workspace setup (mkdir)", local_out)
+            if _is_git(spec.codebase):
+                r = await p.exec(f"git clone --depth 1 {shlex.quote(spec.codebase)} {shlex.quote(run_dir)}")
+                if r.exit_code != 0:
+                    _persist_failure(local_out, "git clone", r.exit_code, r.stdout, r.stderr)
+                    raise RemoteJobError("git clone failed", remote_exit=r.exit_code, log_tail=r.stderr[-2000:])
+            else:
+                await _checked_exec(p, f"mkdir -p {shlex.quote(run_dir)}",
+                                    "workspace setup (mkdir)", local_out)
+                await p.push(spec.codebase, run_dir)
 
-        # --- pull results ---
-        if await p.exists_remote(results_remote):
-            await p.pull(results_remote, local_out)
-        elif remote_exit == 0:
-            raise ResultsMissingError(f"job succeeded but no results dir at {results_remote}")
+            # --- run (setup then job), tee'd to a log that travels back ---
+            timed_out: ExecTimeoutError | None = None
+            try:
+                job_res = await p.exec(_job_script(spec, run_dir), env=spec.env,
+                                       timeout=spec.timeout)
+                remote_exit = job_res.exit_code
+            except ExecTimeoutError as e:
+                # Still try to salvage whatever the job wrote before re-raising —
+                # partial results + run.log are exactly what you want after a
+                # timeout, and the box is torn down on exit either way.
+                timed_out = e
+                remote_exit = None
 
-        if timed_out is not None:
-            raise timed_out
+            if remote_exit not in (0, None):
+                if getattr(p, "_lifetime_expired", False):
+                    # The lifetime watchdog killed the box mid-job — exec just
+                    # sees ssh die (rc=255); name the real cause instead of
+                    # reporting a phantom job failure.
+                    raise BellhopError(
+                        f"box {p.id} hit max_lifetime mid-job — the job was "
+                        "killed by the lifetime watchdog, not by its own failure "
+                        f"(results salvage was attempted; check {local_out})")
+                _persist_failure(local_out, "job", remote_exit, job_res.stdout, job_res.stderr)
+
+            # --- pull results ---
+            if await p.exists_remote(results_remote):
+                await p.pull(results_remote, local_out)
+            elif remote_exit == 0:
+                raise ResultsMissingError(f"job succeeded but no results dir at {results_remote}")
+
+            if timed_out is not None:
+                raise timed_out
+        except BaseException:
+            if keep_on_failure:
+                p.keep = True
+                print(f"bellhop: run {spec.slug!r} failed — keep_on_failure leaves "
+                      f"box {p.id} UP (it keeps billing; tear it down yourself)",
+                      file=sys.stderr, flush=True)
+            raise
+        if remote_exit != 0 and keep_on_failure:
+            # nonzero exit raises *after* this block — flag the keep now,
+            # while the context manager can still honor it
+            p.keep = True
+            print(f"bellhop: job {spec.slug!r} exited {remote_exit} — keep_on_failure "
+                  f"leaves box {p.id} UP (it keeps billing; tear it down yourself)",
+                  file=sys.stderr, flush=True)
 
         # --- upload to GCS (from this box; creds never touch the pod) ---
         gcs_uri = retrieve_cmd = None
@@ -163,7 +228,9 @@ async def run(spec: RunSpec, backend: "Backend", *, keep_pod: bool = False,
         )
 
     if remote_exit != 0:
-        raise RemoteJobError(f"remote job exited {remote_exit}", remote_exit=remote_exit, log_tail=result.log_tail)
+        raise RemoteJobError(
+            f"remote job exited {remote_exit} (full output: {local_out}/failure.log)",
+            remote_exit=remote_exit, log_tail=result.log_tail)
     return result
 
 

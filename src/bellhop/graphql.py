@@ -55,6 +55,15 @@ class RunpodGraphQL:
         resp = await self._client.post(
             GRAPHQL_URL, json={"query": query, "variables": variables},
         )
+        if resp.status_code in (401, 403):
+            # RunPod's unauthorized body is literally {"error":{}} — name the
+            # actual problem instead of relaying an empty shrug.
+            raise ProvisionError(
+                f"graphql HTTP {resp.status_code} unauthorized: check RUNPOD_API_KEY "
+                "(bellhop sends it as an Authorization: Bearer header to "
+                f"{GRAPHQL_URL}; a key that works with runpodctl's ?api_key= "
+                f"style but fails here is malformed/expired) — body: {resp.text[:200]}"
+            )
         if resp.status_code >= 300:
             raise ProvisionError(f"graphql HTTP {resp.status_code}: {resp.text[:400]}")
         body = resp.json()
