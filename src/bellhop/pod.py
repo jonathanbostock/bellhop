@@ -8,20 +8,20 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
-import os
 import shlex
 import time
 import warnings
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
-from pathlib import Path
 from typing import AsyncIterator, Literal
 
-from .backend import TAR_EXCLUDES, ExecResult
-from .errors import ExecTimeoutError, PodNotReadyError, PreflightError, ProvisionError
+from .errors import PodNotReadyError, PreflightError, ProvisionError
 from .graphql import RunpodGraphQL
 from .probes import ReadyProbe, SshProbe
 from .rest import RunpodRest
+from .sshbox import SSH_OPTS, SshBox, pubkey_text, resolve_ssh_key
+
+__all__ = ["GPU_ALIASES", "IMAGE_PRESETS", "Pod", "PodConfig", "SSH_OPTS", "pod"]
 
 
 def _iso(dt: datetime) -> str:
@@ -64,14 +64,6 @@ def _canon_gpu(name: str) -> str:
 _ALIAS_LOOKUP = {_canon_gpu(k): v for k, v in GPU_ALIASES.items()}
 DEFAULT_GPU_IMAGE = IMAGE_PRESETS["pytorch-cuda"]
 DEFAULT_CPU_IMAGE = IMAGE_PRESETS["cpu-base"]
-
-SSH_OPTS = [
-    "-o", "StrictHostKeyChecking=no",
-    "-o", "UserKnownHostsFile=/dev/null",
-    "-o", "LogLevel=ERROR",
-    "-o", "ConnectTimeout=10",
-    "-o", "ServerAliveInterval=30",
-]
 
 
 @dataclass
@@ -178,16 +170,10 @@ class PodConfig:
         return DEFAULT_GPU_IMAGE if self.resolved_compute == "gpu" else DEFAULT_CPU_IMAGE
 
     def resolve_ssh_key(self) -> str:
-        key = self.ssh_key or os.path.expanduser("~/.ssh/id_ed25519")
-        if not Path(key).exists():
-            raise PreflightError(f"ssh private key not found: {key}")
-        return key
+        return resolve_ssh_key(self.ssh_key)
 
     def pubkey_text(self) -> str:
-        pub = self.resolve_ssh_key() + ".pub"
-        if not Path(pub).exists():
-            raise PreflightError(f"ssh public key not found: {pub}")
-        return Path(pub).read_text().strip()
+        return pubkey_text(self.ssh_key)
 
     def to_create_body(self) -> dict:
         env = dict(self.env)
@@ -254,8 +240,15 @@ class PodConfig:
         return inp
 
 
-class Pod:
-    """A live pod. Construct via :func:`pod` (the async context manager)."""
+class Pod(SshBox):
+    """A live pod. Construct via :func:`pod` (the async context manager).
+
+    Transport (exec / push / pull / probes) comes from :class:`SshBox`; this
+    class adds the RunPod-specific halves: REST lifecycle and the NAT-mapped
+    SSH endpoint.
+    """
+
+    _noun = "pod"
 
     def __init__(self, rest: RunpodRest, pod_id: str, config: PodConfig):
         self._rest = rest
@@ -263,6 +256,10 @@ class Pod:
         self.config = config
         self._meta: dict = {}
         self._ssh_key = config.resolve_ssh_key()
+
+    @property
+    def ssh_user(self) -> str:
+        return self.config.ssh_user
 
     # ---- connection info ---------------------------------------------------
     @property
@@ -318,110 +315,12 @@ class Pod:
     async def teardown(self) -> None:
         await self._rest.delete_pod(self.id)
 
-    # ---- exec / transfer ---------------------------------------------------
-    def _ssh_argv(self) -> list[str]:
+    # ---- exec / transfer: inherited from SshBox ------------------------------
+    def _ssh_endpoint(self) -> tuple[str, int]:
         port = self.mapped_port(22)
         if not (self.host and port):
             raise PodNotReadyError("ssh endpoint not available yet")
-        return ["ssh", "-i", self._ssh_key, *SSH_OPTS, "-p", str(port),
-                f"{self.config.ssh_user}@{self.host}"]
-
-    def _ssh_prefix(self) -> str:
-        return " ".join(shlex.quote(a) for a in self._ssh_argv())
-
-    async def _ssh_raw(self, cmd: str, timeout: float = 600) -> ExecResult:
-        """Run a single command over ssh (no readiness gating)."""
-        proc = await asyncio.create_subprocess_exec(
-            *self._ssh_argv(), cmd,
-            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
-        )
-        out, err = await _communicate(proc, timeout=timeout)
-        return ExecResult(proc.returncode or 0, out, err)
-
-    async def exec(self, cmd: str, env: dict[str, str] | None = None,
-                   timeout: float | None = None) -> ExecResult:
-        """Run command(s) on the pod.
-
-        No client-side timeout by default: a long training job runs until the
-        pod's own TTL (``stop_after``/``terminate_after``/``max_lifetime``)
-        kills it, and a *dead* connection is caught by ssh's ServerAlive
-        keepalive rather than a wall-clock guess. Pass a finite ``timeout``
-        (seconds) to cap this one command — it raises :class:`ExecTimeoutError`
-        on expiry (the remote process may keep running on the pod).
-
-        Env vars are exported *inside* the script (a fresh sshd session does not
-        inherit the container's PID-1 env), and the whole script is fed over
-        stdin to ``bash -ls`` so secret values never appear in the pod's argv.
-        """
-        exports = "\n".join(f"export {k}={shlex.quote(v)}" for k, v in (env or {}).items())
-        script = f"set -o pipefail\n{exports}\n{cmd}\n"
-        proc = await asyncio.create_subprocess_exec(
-            *self._ssh_argv(), "bash", "-ls",
-            stdin=asyncio.subprocess.PIPE,
-            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
-        )
-        try:
-            out, err = await _communicate(proc, stdin=script.encode(), timeout=timeout)
-        except asyncio.TimeoutError:
-            head = cmd.strip().splitlines()[0][:120] if cmd.strip() else cmd
-            raise ExecTimeoutError(
-                f"exec timed out after {timeout:.0f}s on pod {self.id}: {head}") from None
-        return ExecResult(proc.returncode or 0, out, err)
-
-    async def push(self, local: str | Path, remote: str) -> None:
-        """Upload a local directory to ``remote`` on the pod (tar-over-ssh)."""
-        local = str(local)
-        if not Path(local).is_dir():
-            raise PreflightError(f"push source not a directory: {local}")
-        excl = " ".join(TAR_EXCLUDES)
-        remote_cmd = f"mkdir -p {shlex.quote(remote)} && tar xzf - -C {shlex.quote(remote)}"
-        pipeline = (
-            f"tar czf - -C {shlex.quote(local)} {excl} . "
-            f"| {self._ssh_prefix()} {shlex.quote(remote_cmd)}"
-        )
-        await _run_shell(pipeline, what="push")
-
-    async def pull(self, remote: str, local_dest: str | Path) -> None:
-        """Download remote dir into ``local_dest`` (creates local_dest/<basename>)."""
-        local_dest = str(local_dest)
-        Path(local_dest).mkdir(parents=True, exist_ok=True)
-        parent = os.path.dirname(remote.rstrip("/")) or "/"
-        base = os.path.basename(remote.rstrip("/"))
-        remote_cmd = f"tar czf - -C {shlex.quote(parent)} {shlex.quote(base)}"
-        pipeline = (
-            f"{self._ssh_prefix()} {shlex.quote(remote_cmd)} "
-            f"| tar xzf - -C {shlex.quote(local_dest)}"
-        )
-        await _run_shell(pipeline, what="pull")
-
-    async def exists_remote(self, path: str) -> bool:
-        res = await self._ssh_raw(f"test -e {shlex.quote(path)}")
-        return res.exit_code == 0
-
-    async def call(self, fn, *args, **kwargs):
-        """Run a local Python function on the pod; see :func:`bellhop.call.call`."""
-        from .call import call as _call
-        return await _call(self, fn, *args, **kwargs)
-
-
-async def _communicate(proc, stdin: bytes | None = None, timeout: float = 600):
-    try:
-        out, err = await asyncio.wait_for(proc.communicate(stdin), timeout=timeout)
-    except asyncio.TimeoutError:
-        with contextlib.suppress(ProcessLookupError):
-            proc.kill()
-        await proc.wait()
-        raise
-    return out.decode("utf-8", "replace"), err.decode("utf-8", "replace")
-
-
-async def _run_shell(pipeline: str, what: str) -> None:
-    proc = await asyncio.create_subprocess_shell(
-        pipeline, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
-    )
-    out, err = await proc.communicate()
-    if proc.returncode != 0:
-        raise RuntimeError(f"{what} failed (rc={proc.returncode}): {err.decode('utf-8','replace')[:500]}")
+        return self.host, port
 
 
 async def _gql_create(config: PodConfig, api_key: str | None) -> dict:
