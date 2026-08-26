@@ -3,9 +3,11 @@
 create -> wait-functional -> upload codebase -> setup+run (tee'd) -> pull
 results -> upload to GCS -> teardown -> structured RunResult.
 
-Backend-agnostic: hand it a ``PodConfig`` (RunPod) or a ``ModalConfig`` (Modal)
-and the pipeline runs identically — the only provider-specific work happens
-behind :func:`bellhop.backend.open_box`.
+Backend-agnostic: hand it a ``PodConfig`` (RunPod), ``ModalConfig`` (Modal),
+``LambdaConfig`` (Lambda Cloud) or ``NebiusConfig`` (Nebius) and the pipeline
+runs identically — the only provider-specific work happens behind
+:func:`bellhop.backend.open_box`. (Every backend guarantees a writable
+``/workspace``, so the ``/workspace/<slug>`` layout is uniform.)
 """
 
 from __future__ import annotations
@@ -27,10 +29,12 @@ from .errors import (
 )
 
 if TYPE_CHECKING:
+    from .lambda_box import LambdaConfig
     from .modal_box import ModalConfig
+    from .nebius_box import NebiusConfig
     from .pod import PodConfig
 
-    Backend = PodConfig | ModalConfig
+    Backend = PodConfig | ModalConfig | LambdaConfig | NebiusConfig
 
 # GCS upload is opt-in: pass gcs_base="gs://your-bucket/prefix" (or --gcs-base) to enable.
 DEFAULT_GCS_BASE = None
@@ -91,11 +95,12 @@ async def _checked_exec(box, cmd: str, what: str) -> None:
 
 async def run(spec: RunSpec, backend: "Backend", *, keep_pod: bool = False,
               api_key: str | None = None) -> RunResult:
-    """Run ``spec`` on the box implied by ``backend`` (PodConfig or ModalConfig).
+    """Run ``spec`` on the box implied by ``backend``'s config type.
 
     ``keep_pod`` leaves the box up after the run (kept for name compatibility;
-    applies to a Modal sandbox too). ``api_key`` is the RunPod key and is ignored
-    by the Modal backend (Modal uses its own ambient auth).
+    applies to every backend — NB on Lambda/Nebius a kept box has NO server-side
+    TTL). ``api_key`` is the RunPod key and is ignored by the other backends
+    (they use their own ambient auth).
     """
     if not (spec.slug and spec.codebase and spec.run):
         raise PreflightError("slug, codebase and run are all required")

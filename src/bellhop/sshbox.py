@@ -26,11 +26,12 @@ import contextlib
 import os
 import shlex
 import sys
+import time
 from datetime import timedelta
 from pathlib import Path
 
 from .backend import TAR_EXCLUDES, ExecResult
-from .errors import ExecTimeoutError, PreflightError
+from .errors import ExecTimeoutError, PodNotReadyError, PreflightError, ProvisionError
 
 SSH_OPTS = [
     "-o", "StrictHostKeyChecking=no",
@@ -171,17 +172,79 @@ async def _run_shell(pipeline: str, what: str) -> None:
         raise RuntimeError(f"{what} failed (rc={proc.returncode}): {err.decode('utf-8','replace')[:500]}")
 
 
+async def wait_ready(box, probe, timeout: timedelta, interval: float) -> None:
+    """Poll ``probe(box)`` until it passes; a raising probe = not ready yet.
+
+    The shared readiness loop behind Pod._wait_ready and the Lambda/Nebius
+    equivalents (each backend keeps its own *provision* wait — provider states
+    differ — but "functional" is probed the same way everywhere).
+    """
+    deadline = time.monotonic() + timeout.total_seconds()
+    while True:
+        try:
+            ok = await probe(box)
+        except Exception:
+            ok = False  # a raising probe = not ready yet (see probes.py)
+        if ok:
+            return
+        if time.monotonic() >= deadline:
+            raise PodNotReadyError(
+                f"{box._noun} {box.id} provisioned but readiness probe never passed "
+                f"within {timeout.total_seconds():.0f}s"
+            )
+        await asyncio.sleep(interval)
+
+
+async def ensure_workspace(box) -> None:
+    """Make ``/workspace`` exist and belong to the ssh user.
+
+    ``run()`` lays jobs out under ``/workspace/<slug>`` on every backend.
+    RunPod and Modal run as root so that just works; the ubuntu-style users on
+    Lambda/Nebius can't write ``/``, but do have passwordless sudo — so this
+    one-time bootstrap keeps the path contract identical across providers.
+    """
+    r = await box.exec('sudo -n mkdir -p /workspace && sudo -n chown "$(id -un):$(id -gn)" /workspace')
+    if r.exit_code != 0:
+        raise ProvisionError(
+            f"could not prepare /workspace on {box._noun} {box.id} "
+            f"(rc={r.exit_code}): {(r.stderr or r.stdout)[-500:]}"
+        )
+
+
+async def install_pip(box, specs: list[str]) -> None:
+    """``config.pip`` deps-on-enter, shared by the SSH backends."""
+    quoted = " ".join(shlex.quote(s) for s in specs)
+    r = await box.exec(f"python3 -m pip install -q {quoted}")
+    if r.exit_code != 0:
+        raise ProvisionError(
+            f"config.pip install failed on {box._noun} {box.id} "
+            f"(rc={r.exit_code}): {(r.stderr or r.stdout)[-500:]}"
+        )
+
+
 async def lifetime_watchdog(box, lifetime: timedelta) -> None:
     """Client-side ``max_lifetime`` enforcement for providers with no server TTL.
 
     Tears the box down out from under any still-running exec — its ssh
     sessions die and the exec fails, which is the intended failure mode (the
-    ``cluster.py`` watchdog behaves the same way). Only protects against
-    forgotten boxes while *this process lives*; it is not a substitute for a
-    server-side timer, which Lambda and Nebius simply do not offer.
+    ``cluster.py`` watchdog behaves the same way). ``_lifetime_expired`` is
+    set first so the provisioning context manager can turn the resulting
+    mid-run failure into a clear "hit max_lifetime" error instead of a
+    baffling ssh exit-255. Only protects against forgotten boxes while *this
+    process lives*; it is not a substitute for a server-side timer, which
+    Lambda and Nebius simply do not offer.
     """
     await asyncio.sleep(lifetime.total_seconds())
+    box._lifetime_expired = True
     print(f"bellhop: {box._noun} {box.id} hit max_lifetime {lifetime} — tearing down",
           file=sys.stderr, flush=True)
-    with contextlib.suppress(Exception):
-        await box.teardown()
+    for attempt in range(3):
+        try:
+            await box.teardown()
+            return
+        except Exception as e:
+            err = e
+        await asyncio.sleep(10 * (attempt + 1))
+    # Never bare-suppress a failed reap on a TTL-less provider: say what leaked.
+    print(f"bellhop: watchdog could not tear down {box._noun} {box.id} ({err}) — "
+          f"it is still billing; reap it manually", file=sys.stderr, flush=True)

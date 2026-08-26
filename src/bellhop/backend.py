@@ -2,16 +2,18 @@
 
 Bellhop's identity is the imperative *check in -> run -> check out* lifecycle:
 provision a disposable box, carry your code up (``push``), run steps against it
-(``exec``), bring results back (``pull``), and check out (``teardown``). Two
+(``exec``), bring results back (``pull``), and check out (``teardown``). Four
 providers implement that contract:
 
 - **RunPod** — an SSH-able GPU/CPU pod (:class:`bellhop.pod.Pod`).
 - **Modal** — an ephemeral Sandbox container (:class:`bellhop.modal_box.Sandbox`).
+- **Lambda Cloud** — an on-demand GPU VM (:class:`bellhop.lambda_box.LambdaInstance`).
+- **Nebius** — a GPU/CPU VM (:class:`bellhop.nebius_box.NebiusVm`).
 
 ``run()`` / ``run_many()`` (see run.py) are written against this protocol and
-pick a backend purely from the config type you hand them
-(:class:`~bellhop.pod.PodConfig` -> RunPod, :class:`~bellhop.modal_box.ModalConfig`
--> Modal), via :func:`open_box`.
+pick a backend purely from the config type you hand them (``PodConfig`` ->
+RunPod, ``ModalConfig`` -> Modal, ``LambdaConfig`` -> Lambda, ``NebiusConfig``
+-> Nebius), via :func:`open_box`.
 
 :func:`bellhop.call.call` (remote function execution) is *derived* from these
 primitives, not part of the protocol — it works over any ExecBox.
@@ -66,8 +68,12 @@ async def open_box(backend, *, keep: bool = False,
     """Provision the box implied by ``backend``'s type, yield it, tear it down.
 
     Dispatches on the config class so callers never branch on provider:
-    ``PodConfig`` -> RunPod pod, ``ModalConfig`` -> Modal sandbox. Imports are
-    local so a RunPod-only install never needs ``modal`` (and vice versa).
+    ``PodConfig`` -> RunPod pod, ``ModalConfig`` -> Modal sandbox,
+    ``LambdaConfig`` -> Lambda instance, ``NebiusConfig`` -> Nebius VM.
+    Imports are local so a RunPod-only install never needs ``modal`` or
+    ``nebius`` (and vice versa). ``api_key`` is the *RunPod* key — the other
+    providers use their own ambient auth (LAMBDA_API_KEY, Modal token,
+    Nebius IAM credentials).
     """
     # Local imports avoid a circular dependency (pod/modal_box import this
     # module for ExecResult) and keep provider deps optional.
@@ -78,6 +84,13 @@ async def open_box(backend, *, keep: bool = False,
             yield p
         return
 
+    from .lambda_box import LambdaConfig, instance
+
+    if isinstance(backend, LambdaConfig):
+        async with instance(backend, keep=keep) as i:
+            yield i
+        return
+
     from .modal_box import ModalConfig, sandbox
 
     if isinstance(backend, ModalConfig):
@@ -85,7 +98,14 @@ async def open_box(backend, *, keep: bool = False,
             yield s
         return
 
+    from .nebius_box import NebiusConfig, vm
+
+    if isinstance(backend, NebiusConfig):
+        async with vm(backend, keep=keep) as v:
+            yield v
+        return
+
     raise PreflightError(
-        f"unknown backend config {type(backend).__name__!r}; "
-        "expected PodConfig (RunPod) or ModalConfig (Modal)"
+        f"unknown backend config {type(backend).__name__!r}; expected PodConfig "
+        "(RunPod), ModalConfig (Modal), LambdaConfig (Lambda) or NebiusConfig (Nebius)"
     )

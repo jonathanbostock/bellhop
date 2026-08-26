@@ -37,25 +37,37 @@ class ProvisionError(BellhopError):
     exit_code = 20
 
 
-# RunPod's ways of saying "no stock", collected from live runs (issue #27's
-# probe matrix and stock-outs since). Heuristic by necessity — the API gives
-# prose, not codes — so keep entries lowercase substrings.
+# The providers' ways of saying "no stock", collected from live runs (issue
+# #27's probe matrix and stock-outs since) and from each API's documented
+# error codes. Heuristic by necessity — RunPod gives prose, not codes — so
+# keep entries lowercase substrings.
 CAPACITY_SIGNATURES = (
+    # RunPod
     "no capacity",                       # graphql null-pod spelling
     "does not have the resources",       # graphql machine-match failure
     "no longer any instances available", # rest out-of-stock
     "out of stock",
     "no instances",
     "insufficient resources",            # createCluster out-of-stock (M0 probe)
+    # Lambda (documented code instance-operations/launch/insufficient-capacity,
+    # default message "Not enough capacity to fulfill launch request.")
+    "insufficient-capacity",
+    "not enough capacity",
+    # Nebius (documented "Not enough resources"; gRPC RESOURCE_EXHAUSTED also
+    # covers quota — retrying elsewhere is the right move for both)
+    "not enough resources",
+    "resource_exhausted",
+    "resource exhausted",
+    "quota limit exceeded",
 )
 
 
 def is_capacity_error(err: BaseException) -> bool:
     """Best-effort: does this provision failure look like a stock-out?
 
-    Lets callers (retry loops, live test suites) separate "RunPod has no
+    Lets callers (retry loops, live test suites) separate "the provider has no
     machines right now" from "my request is broken". False negatives are
-    possible when RunPod invents new prose; treat a True as reliable and a
+    possible when a provider invents new prose; treat a True as reliable and a
     False as "unknown".
     """
     msg = str(err).lower()

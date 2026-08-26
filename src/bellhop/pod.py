@@ -19,7 +19,14 @@ from .errors import PodNotReadyError, PreflightError, ProvisionError
 from .graphql import RunpodGraphQL
 from .probes import ReadyProbe, SshProbe
 from .rest import RunpodRest
-from .sshbox import SSH_OPTS, SshBox, pubkey_text, resolve_ssh_key
+from .sshbox import (
+    SSH_OPTS,
+    SshBox,
+    install_pip,
+    pubkey_text,
+    resolve_ssh_key,
+    wait_ready,
+)
 
 __all__ = ["GPU_ALIASES", "IMAGE_PRESETS", "Pod", "PodConfig", "SSH_OPTS", "pod"]
 
@@ -297,20 +304,8 @@ class Pod(SshBox):
             await asyncio.sleep(self.config.poll_interval)
 
     async def _wait_ready(self) -> None:
-        deadline = time.monotonic() + self.config.ready_timeout.total_seconds()
-        while True:
-            try:
-                ok = await self.config.ready(self)
-            except Exception:
-                ok = False  # a raising probe = not ready yet (see probes.py)
-            if ok:
-                return
-            if time.monotonic() >= deadline:
-                raise PodNotReadyError(
-                    f"pod {self.id} provisioned but readiness probe never passed "
-                    f"within {self.config.ready_timeout.total_seconds():.0f}s"
-                )
-            await asyncio.sleep(self.config.poll_interval)
+        await wait_ready(self, self.config.ready, self.config.ready_timeout,
+                         self.config.poll_interval)
 
     async def teardown(self) -> None:
         await self._rest.delete_pod(self.id)
@@ -396,13 +391,7 @@ async def pod(config: PodConfig, *, keep: bool = False,
             await p._wait_provision()
             await p._wait_ready()
             if config.pip:
-                specs = " ".join(shlex.quote(s) for s in config.pip)
-                r = await p.exec(f"python3 -m pip install -q {specs}")
-                if r.exit_code != 0:
-                    raise ProvisionError(
-                        f"config.pip install failed on pod {pod_id} "
-                        f"(rc={r.exit_code}): {(r.stderr or r.stdout)[-500:]}"
-                    )
+                await install_pip(p, config.pip)
             yield p
         finally:
             if not keep:
