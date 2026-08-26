@@ -89,14 +89,36 @@ class PodConfig:
     cloud_fallback: bool = True            # COMMUNITY out-of-stock -> retry SECURE
     ports: list[str] = field(default_factory=lambda: ["22/tcp"])
     env: dict[str, str] = field(default_factory=dict)
+    # pip specs installed right after readiness, before the pod is yielded —
+    # the RunPod peer of ModalConfig.pip (there it's baked into the image;
+    # here it's a post-ready `python3 -m pip install`). Pre-flight conflicts
+    # locally (`uv pip compile`) before burning pod-hours on a bad pin set.
+    pip: list[str] = field(default_factory=list)
+    # Host CUDA-driver filter. RunPod schedules onto any host meeting the
+    # IMAGE's CUDA floor, which can be far older than what your wheels need
+    # (a cu13-linked vllm wheel dies on a 12.9-driver host with "driver too
+    # old"). List the acceptable host CUDA versions, e.g. ["13.0", "13.1"].
+    cuda_versions: list[str] | None = None
+    # Container start command override (single shell command string). Lets
+    # non-RunPod images (which don't consume PUBLIC_KEY or start sshd) work as
+    # ssh job pods — e.g. bootstrap sshd and block:
+    #   "apt-get update && apt-get install -y openssh-server && mkdir -p /run/sshd ~/.ssh
+    #    && echo \"$PUBLIC_KEY\" > ~/.ssh/authorized_keys && chmod 600 ~/.ssh/authorized_keys
+    #    && /usr/sbin/sshd -D"
+    # The command IS the container's main process: it must block (sshd -D,
+    # sleep infinity) or the pod exits and crashloops.
+    docker_start_cmd: str | None = None
     name: str = "bellhop"
     # auth / connection
     ssh_key: str | None = None             # private key; default ~/.ssh/id_ed25519
     ssh_user: str = "root"
-    # readiness
+    # readiness. Defaults resolve in __post_init__: 300s/420s normally, but
+    # 1200s each when docker_start_cmd is set — a bootstrap that apt-installs
+    # its way to sshd routinely needs 5-15 min before the pod is reachable,
+    # and the wait loops exit early on success so a generous cap is free.
     ready: ReadyProbe = field(default_factory=lambda: SshProbe("true"))
-    provision_timeout: timedelta = timedelta(seconds=300)
-    ready_timeout: timedelta = timedelta(seconds=420)
+    provision_timeout: timedelta | None = None
+    ready_timeout: timedelta | None = None
     poll_interval: float = 8.0
     # native server-side safety timers (GraphQL only; survive host death).
     # stop = halt compute (disk persists); terminate = delete (all billing stops).
@@ -109,6 +131,11 @@ class PodConfig:
     max_lifetime: timedelta | None = None
 
     def __post_init__(self):
+        slow_boot = bool(self.docker_start_cmd)
+        if self.provision_timeout is None:
+            self.provision_timeout = timedelta(seconds=1200 if slow_boot else 300)
+        if self.ready_timeout is None:
+            self.ready_timeout = timedelta(seconds=1200 if slow_boot else 420)
         if self.max_lifetime is not None:
             self.terminate_after = self.max_lifetime
             # the default 24h stop timer would halt a longer job early
@@ -173,6 +200,10 @@ class PodConfig:
             "ports": self.ports,
             "env": env,
         }
+        if self.docker_start_cmd:
+            body["dockerStartCmd"] = ["bash", "-c", self.docker_start_cmd]
+        if self.cuda_versions:
+            body["allowedCudaVersions"] = list(self.cuda_versions)
         if self.resolved_compute == "gpu":
             body["gpuTypeIds"] = self.resolve_gpu_ids()
             body["gpuCount"] = self.gpu_count
@@ -207,6 +238,11 @@ class PodConfig:
             "ports": ",".join(self.ports),
             "env": [{"key": k, "value": v} for k, v in env.items()],
         }
+        if self.docker_start_cmd:
+            # GraphQL's dockerArgs is the single-string spelling of REST's dockerStartCmd
+            inp["dockerArgs"] = f"bash -c {shlex.quote(self.docker_start_cmd)}"
+        if self.cuda_versions:
+            inp["allowedCudaVersions"] = list(self.cuda_versions)
         if self.volume_gb:
             inp["volumeInGb"] = self.volume_gb
             inp["volumeMountPath"] = self.volume_mount_path
@@ -362,6 +398,11 @@ class Pod:
         res = await self._ssh_raw(f"test -e {shlex.quote(path)}")
         return res.exit_code == 0
 
+    async def call(self, fn, *args, **kwargs):
+        """Run a local Python function on the pod; see :func:`bellhop.call.call`."""
+        from .call import call as _call
+        return await _call(self, fn, *args, **kwargs)
+
 
 async def _communicate(proc, stdin: bytes | None = None, timeout: float = 600):
     try:
@@ -392,7 +433,12 @@ async def _gql_create(config: PodConfig, api_key: str | None) -> dict:
     if config.cloud == "COMMUNITY" and config.cloud_fallback:
         clouds.append("SECURE")
     async with RunpodGraphQL(api_key=api_key) as gql:
-        last_err: ProvisionError | None = None
+        # Report every attempt, not just the last: RunPod's GraphQL error
+        # strings are opaque ("Something went wrong", "This machine does not
+        # have the resources"), and a bare last_err hides that other
+        # cloud/GPU combinations were tried and failed differently — which
+        # sent issue #27 chasing dockerArgs when the real story was capacity.
+        errors: list[str] = []
         for cloud in clouds:
             for gid in candidates:
                 gi = config.to_graphql_input(gpu_type_id=gid)
@@ -400,9 +446,11 @@ async def _gql_create(config: PodConfig, api_key: str | None) -> dict:
                 try:
                     return await gql.create_pod_on_demand(gi)
                 except ProvisionError as e:
-                    last_err = e
-        assert last_err is not None
-        raise last_err
+                    errors.append(f"{gid} on {cloud}: {e}")
+        raise ProvisionError(
+            "graphql create failed on every cloud/GPU attempt:\n  "
+            + "\n  ".join(errors)
+        )
 
 
 @contextlib.asynccontextmanager
@@ -448,6 +496,14 @@ async def pod(config: PodConfig, *, keep: bool = False,
         try:
             await p._wait_provision()
             await p._wait_ready()
+            if config.pip:
+                specs = " ".join(shlex.quote(s) for s in config.pip)
+                r = await p.exec(f"python3 -m pip install -q {specs}")
+                if r.exit_code != 0:
+                    raise ProvisionError(
+                        f"config.pip install failed on pod {pod_id} "
+                        f"(rc={r.exit_code}): {(r.stderr or r.stdout)[-500:]}"
+                    )
             yield p
         finally:
             if not keep:

@@ -261,6 +261,11 @@ class Sandbox:
         proc = await self._sb.exec.aio("bash", "-c", f"test -e {shlex.quote(path)}")
         return (await proc.wait.aio()) == 0
 
+    async def call(self, fn, *args, **kwargs):
+        """Run a local Python function in the sandbox; see :func:`bellhop.call.call`."""
+        from .call import call as _call
+        return await _call(self, fn, *args, **kwargs)
+
     async def teardown(self) -> None:
         await self._sb.terminate.aio()
 

@@ -49,6 +49,14 @@ def _parser() -> argparse.ArgumentParser:
     # Modal-specific
     r.add_argument("--pip", action="append", default=None, help="Modal: pip-install onto the image (repeatable)")
     r.add_argument("--timeout-hours", type=float, default=None, help="[deprecated] use --max-lifetime-hours")
+
+    # Instant Clusters have no server-side TTL, so leaks are on us to find
+    c = sub.add_parser("clusters", help="list / reap RunPod Instant Clusters")
+    csub = c.add_subparsers(dest="clusters_cmd", required=True)
+    csub.add_parser("list", help="list the account's clusters")
+    g = csub.add_parser("gc", help="delete clusters older than a threshold")
+    g.add_argument("--older-than-hours", type=float, default=24.0)
+    g.add_argument("--dry-run", action="store_true", help="report only, delete nothing")
     return p
 
 
@@ -85,8 +93,33 @@ def _build_backend(args, env: dict):
     )
 
 
+def _clusters_main(args) -> int:
+    from .cluster import gc_clusters, list_clusters
+
+    try:
+        if args.clusters_cmd == "list":
+            for clu in asyncio.run(list_clusters()):
+                print(f"{clu['id']}  {clu['gpuTypeId']} x{clu['gpuCountPerPod']}/node "
+                      f"x{clu['podCount']} nodes  created {clu['createdAt']}  ({clu['name']})")
+            return 0
+        reaped = asyncio.run(gc_clusters(timedelta(hours=args.older_than_hours),
+                                         dry_run=args.dry_run))
+        verb = "would reap" if args.dry_run else "reaped"
+        for clu in reaped:
+            print(f"{verb} {clu['id']}  {clu['gpuTypeId']} x{clu['podCount']} nodes  "
+                  f"age {clu['age_hours']}h")
+        if not reaped:
+            print(f"no clusters older than {args.older_than_hours}h")
+        return 0
+    except BellhopError as e:
+        print(f"ERROR [{type(e).__name__}]: {e}", file=sys.stderr)
+        return e.exit_code
+
+
 def main(argv: list[str] | None = None) -> int:
     args = _parser().parse_args(argv)
+    if args.cmd == "clusters":
+        return _clusters_main(args)
     env = json.loads(args.env_json) if args.env_json else {}
 
     backend = _build_backend(args, env)

@@ -2,13 +2,13 @@
 # Distribution name is bellhop-py ("bellhop" is squatted on PyPI by an
 # unrelated 2022 package); the import name and CLI remain `bellhop`.
 name = "bellhop-py"
-version = "0.5.0"
+version = "0.8.0"
 description = "Async Python library that checks your code into an ephemeral box (RunPod pod or Modal sandbox), runs it, brings the results back, and checks out."
 readme = "README.md"
 license = "MIT"
 authors = [{ name = "Daniel Tan" }]
 requires-python = ">=3.10"
-dependencies = ["httpx>=0.27"]
+dependencies = ["httpx>=0.27", "cloudpickle>=3.0"]
 keywords = ["runpod", "modal", "gpu", "ephemeral", "compute", "sandbox"]
 classifiers = [
     "Development Status :: 4 - Beta",

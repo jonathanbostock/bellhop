@@ -4,8 +4,8 @@ Mirrors the exit-code ladder of the original ``run.sh`` driver so callers can
 branch on failure mode instead of parsing exit codes:
 
     10 preflight, 20 provision, 30 never-ready,
-    40 remote-job-failed, 41 exec-timeout, 50 results-missing,
-    60 gcs-upload-failed.
+    40 remote-job-failed, 41 exec-timeout, 42 remote-call-raised,
+    50 results-missing, 60 gcs-upload-failed.
 
 The hierarchy is provider-agnostic (RunPod *and* Modal): ``ProvisionError`` is
 raised when either a pod or a sandbox fails to come up, ``RemoteJobError`` when
@@ -37,6 +37,31 @@ class ProvisionError(BellhopError):
     exit_code = 20
 
 
+# RunPod's ways of saying "no stock", collected from live runs (issue #27's
+# probe matrix and stock-outs since). Heuristic by necessity — the API gives
+# prose, not codes — so keep entries lowercase substrings.
+CAPACITY_SIGNATURES = (
+    "no capacity",                       # graphql null-pod spelling
+    "does not have the resources",       # graphql machine-match failure
+    "no longer any instances available", # rest out-of-stock
+    "out of stock",
+    "no instances",
+    "insufficient resources",            # createCluster out-of-stock (M0 probe)
+)
+
+
+def is_capacity_error(err: BaseException) -> bool:
+    """Best-effort: does this provision failure look like a stock-out?
+
+    Lets callers (retry loops, live test suites) separate "RunPod has no
+    machines right now" from "my request is broken". False negatives are
+    possible when RunPod invents new prose; treat a True as reliable and a
+    False as "unknown".
+    """
+    msg = str(err).lower()
+    return any(sig in msg for sig in CAPACITY_SIGNATURES)
+
+
 class PodNotReadyError(BellhopError):
     """Box never became functional within the timeout."""
 
@@ -63,6 +88,22 @@ class ExecTimeoutError(BellhopError):
     """
 
     exit_code = 41
+
+
+class RemoteCallError(BellhopError):
+    """A ``call()``'d function raised on the box.
+
+    Carries the remote traceback text. When the remote exception object could
+    itself be unpickled, *that* exception is re-raised locally with this error
+    as its ``__cause__`` — so callers catch the original type and reach the
+    remote traceback via ``e.__cause__.remote_traceback``.
+    """
+
+    exit_code = 42
+
+    def __init__(self, message: str, *, remote_traceback: str = ""):
+        super().__init__(message)
+        self.remote_traceback = remote_traceback
 
 
 class ResultsMissingError(BellhopError):

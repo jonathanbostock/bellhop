@@ -12,6 +12,9 @@ providers implement that contract:
 pick a backend purely from the config type you hand them
 (:class:`~bellhop.pod.PodConfig` -> RunPod, :class:`~bellhop.modal_box.ModalConfig`
 -> Modal), via :func:`open_box`.
+
+:func:`bellhop.call.call` (remote function execution) is *derived* from these
+primitives, not part of the protocol — it works over any ExecBox.
 """
 
 from __future__ import annotations
