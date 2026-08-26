@@ -28,6 +28,7 @@ import contextlib
 import os
 import re
 import shlex
+import sys
 import time
 from dataclasses import dataclass, field
 from datetime import timedelta
@@ -300,7 +301,6 @@ async def _lifetime_watchdog(clu: Cluster, gql: RunpodGraphQL, rest: RunpodRest,
     # tears the cluster down out from under any still-running exec — its ssh
     # sessions die and exec_all fails, which is the intended failure mode
     await asyncio.sleep(lifetime.total_seconds())
-    import sys
     print(f"bellhop: cluster {clu.id} hit max_lifetime {lifetime} — tearing down",
           file=sys.stderr, flush=True)
     # Grace hook: salvage rank 0's results before destruction (run_cluster
@@ -315,18 +315,50 @@ async def _lifetime_watchdog(clu: Cluster, gql: RunpodGraphQL, rest: RunpodRest,
 
 
 async def _delete_cluster(gql: RunpodGraphQL, rest: RunpodRest,
-                          cluster_id: str, pod_ids: list[str]) -> None:
-    """deleteCluster, then verify the cascade; fall back to per-pod deletes."""
+                          cluster_id: str, pod_ids: list[str]) -> list[str]:
+    """deleteCluster, then verify the cascade; fall back to per-pod deletes.
+
+    The mutation is treated as ADVISORY: it can delete the cluster *object*
+    and orphan still-billing member pods (field report: a "deleted" 2×4×H200
+    cluster left two $22/hr pods running for 3.5h — and the runaway spend
+    saturated the account's spend cap, which then masqueraded as a capacity
+    drought). So every member pod is verified gone, deleted directly when
+    not, re-verified over three rounds, and any survivor is named LOUDLY —
+    a silent suppress here is an open-ended bill. Returns surviving pod ids
+    (empty = everything confirmed dead).
+    """
     with contextlib.suppress(Exception):
         await gql._post(_DELETE_CLUSTER, {"input": {"id": cluster_id}})
-    await asyncio.sleep(5)
-    for pid in pod_ids:
+    survivors = list(pod_ids)
+    for wait in (5, 15, 30):
+        await asyncio.sleep(wait)
+        alive = []
+        for pid in survivors:
+            try:
+                await rest.get_pod(pid)
+            except Exception:
+                continue          # gone — the normal case (M0: cascade works)
+            alive.append(pid)
+            with contextlib.suppress(Exception):
+                await rest.delete_pod(pid)
+        if not alive:
+            return []
+        survivors = alive
+    # the last round's deletes were not re-verified — check before shouting
+    remaining = []
+    for pid in survivors:
         try:
             await rest.get_pod(pid)
+            remaining.append(pid)
         except Exception:
-            continue          # gone — the normal case (M0: cascade works)
-        with contextlib.suppress(Exception):
-            await rest.delete_pod(pid)
+            continue
+    if remaining:
+        print(f"bellhop: cluster {cluster_id} teardown left pods RUNNING AND "
+              f"BILLING: {', '.join(remaining)} — the cluster object may already "
+              "be gone (so `bellhop clusters gc` orphan sweep or the RunPod "
+              "console are the levers); delete them NOW",
+              file=sys.stderr, flush=True)
+    return remaining
 
 
 @contextlib.asynccontextmanager
@@ -437,4 +469,22 @@ async def gc_clusters(older_than: timedelta, *, api_key: str | None = None,
                     await _delete_cluster(gql, rest, clu["id"],
                                           [p["id"] for p in clu.get("pods") or []])
                 reaped.append({**clu, "age_hours": round(age.total_seconds() / 3600, 2)})
+        # Orphan sweep: deleteCluster can kill the cluster OBJECT and leave
+        # its member pods running (see _delete_cluster) — and once the object
+        # is gone, the cluster list above can't see them at all. A member pod
+        # carries its cluster linkage in the REST record, so a pod pointing
+        # at a cluster that no longer exists is exact-match garbage (its
+        # rendezvous peer group is gone) and is reaped regardless of
+        # older_than. No name/timestamp heuristics: if RunPod's REST stops
+        # reporting the linkage, this sweep quietly finds nothing.
+        live = {clu["id"] for clu in data["myself"]["clusters"]}
+        for pd in await rest.list_pods():
+            linked = pd.get("clusterId") or pd.get("instantClusterId")
+            if not linked or linked in live:
+                continue
+            if not dry_run:
+                with contextlib.suppress(Exception):
+                    await rest.delete_pod(pd["id"])
+            reaped.append({"id": pd["id"], "orphaned_pod_of": linked,
+                           "name": pd.get("name", "?")})
     return reaped

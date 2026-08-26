@@ -185,3 +185,15 @@ to a feature in this fork:
    nobody printed; RunPod's 401 body is literally `{"error":{}}`. →
    `failure.log` persists every failing step's full output; auth errors name
    the key, the header style, and the endpoint.
+8. **`deleteCluster` orphans member pods.** The raw mutation can delete the
+   cluster *object* while its pods keep running under default names (a
+   "deleted" 2×4×H200 left two $22/hr pods billing 3.5h — and the runaway
+   spend saturated the account's spend cap, which then masqueraded as a
+   capacity drought for unrelated creates). → `_delete_cluster` treats the
+   mutation as advisory: per-pod delete + three verify rounds + survivors
+   named LOUDLY on stderr; and `bellhop clusters gc` gained an orphan sweep
+   that reaps pods whose REST record links them to a cluster that no longer
+   exists (exact linkage match, never name/timestamp heuristics — a
+   hand-made pod can't be misidentified). Corollary for debugging: when
+   creates suddenly fail "for capacity", check the account spend cap and
+   sweep for orphans first.

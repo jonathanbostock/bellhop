@@ -169,10 +169,15 @@ def _clusters_main(args) -> int:
                                          dry_run=args.dry_run))
         verb = "would reap" if args.dry_run else "reaped"
         for clu in reaped:
-            print(f"{verb} {clu['id']}  {clu['gpuTypeId']} x{clu['podCount']} nodes  "
-                  f"age {clu['age_hours']}h")
+            if clu.get("orphaned_pod_of"):
+                # a still-billing pod whose cluster object no longer exists
+                print(f"{verb} ORPHANED pod {clu['id']}  (cluster "
+                      f"{clu['orphaned_pod_of']} is gone)  ({clu['name']})")
+            else:
+                print(f"{verb} {clu['id']}  {clu['gpuTypeId']} x{clu['podCount']} nodes  "
+                      f"age {clu['age_hours']}h")
         if not reaped:
-            print(f"no clusters older than {args.older_than_hours}h")
+            print(f"no clusters older than {args.older_than_hours}h (and no orphaned pods)")
         return 0
     except BellhopError as e:
         print(f"ERROR [{type(e).__name__}]: {e}", file=sys.stderr)

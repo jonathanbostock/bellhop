@@ -170,8 +170,9 @@ def test_exec_all_failure_raises_cluster_job_error():
 # ---- teardown fallback ------------------------------------------------------
 
 class _FakeRest:
-    def __init__(self, survivors):
+    def __init__(self, survivors, undeletable=()):
         self.survivors = set(survivors)
+        self.undeletable = set(undeletable)   # deletes silently fail (the orphan bug)
         self.deleted = []
 
     async def get_pod(self, pid):
@@ -181,6 +182,15 @@ class _FakeRest:
 
     async def delete_pod(self, pid):
         self.deleted.append(pid)
+        if pid not in self.undeletable:
+            self.survivors.discard(pid)
+
+    async def list_pods(self):
+        return [{"id": pid} for pid in sorted(self.survivors)]
+
+
+async def _no_sleep(_):
+    return None
 
 
 def test_delete_cluster_falls_back_to_pod_deletes(monkeypatch):
@@ -189,10 +199,78 @@ def test_delete_cluster_falls_back_to_pod_deletes(monkeypatch):
         rest = _FakeRest(survivors={"p1"})
         # patch out the cascade-settle sleep so the test is instant
         monkeypatch.setattr(asyncio, "sleep", _no_sleep)
-        await _delete_cluster(gql, rest, "cid", ["p0", "p1"])
+        remaining = await _delete_cluster(gql, rest, "cid", ["p0", "p1"])
         assert rest.deleted == ["p1"]   # only the survivor
-
-    async def _no_sleep(_):
-        return None
+        assert remaining == []          # ...and its death was verified
 
     asyncio.run(_run())
+
+
+def test_delete_cluster_names_unkillable_pods_loudly(monkeypatch, capsys):
+    # deleteCluster can orphan still-billing member pods; a delete that keeps
+    # failing must be shouted about, never suppressed into silence
+    async def _run():
+        gql = _FakeGql([{"deleteCluster": True}])
+        rest = _FakeRest(survivors={"p0", "p1"}, undeletable={"p1"})
+        monkeypatch.setattr(asyncio, "sleep", _no_sleep)
+        remaining = await _delete_cluster(gql, rest, "cid", ["p0", "p1"])
+        assert remaining == ["p1"]
+        assert rest.deleted.count("p1") == 3   # one delete attempt per verify round
+
+    asyncio.run(_run())
+    err = capsys.readouterr().err
+    assert "RUNNING AND BILLING" in err and "p1" in err
+
+
+def test_gc_orphan_sweep_reaps_pods_of_dead_clusters(monkeypatch):
+    import importlib
+
+    clumod = importlib.import_module("bellhop.cluster")
+
+    class _Gql:
+        def __init__(self, api_key=None):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *exc):
+            pass
+
+        async def _post(self, q, v):
+            return {"myself": {"clusters": [
+                {"id": "live-c", "createdAt": "2026-08-26T00:00:00Z",
+                 "gpuTypeId": "NVIDIA H200", "podCount": 2, "pods": []}]}}
+
+    deleted = []
+
+    class _Rest:
+        def __init__(self, api_key=None):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *exc):
+            pass
+
+        async def list_pods(self):
+            return [
+                {"id": "member", "name": "n0", "clusterId": "live-c"},   # cluster alive
+                {"id": "orphan", "name": "n1", "clusterId": "dead-c"},   # cluster gone
+                {"id": "plain", "name": "n2"},                            # not a cluster pod
+            ]
+
+        async def delete_pod(self, pid):
+            deleted.append(pid)
+
+    monkeypatch.setattr(clumod, "RunpodGraphQL", _Gql)
+    monkeypatch.setattr(clumod, "RunpodRest", _Rest)
+    # threshold far in the future so the live cluster itself is not reaped
+    reaped = asyncio.run(clumod.gc_clusters(timedelta(hours=10_000)))
+    assert [r["id"] for r in reaped] == ["orphan"] and deleted == ["orphan"]
+    assert reaped[0]["orphaned_pod_of"] == "dead-c"
+
+    deleted.clear()
+    reaped = asyncio.run(clumod.gc_clusters(timedelta(hours=10_000), dry_run=True))
+    assert [r["id"] for r in reaped] == ["orphan"] and deleted == []

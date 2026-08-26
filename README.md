@@ -344,6 +344,10 @@ Cluster-specific behavior to know about:
 - **Clusters have no server-side TTL** — teardown is the context manager plus
   a client-side `max_lifetime` watchdog. Sweep up leaks with
   `bellhop clusters list` / `bellhop clusters gc --older-than-hours 24`.
+- **RunPod's `deleteCluster` can orphan member pods** (cluster object gone,
+  pods still billing). bellhop's teardown deletes every member pod directly,
+  verifies each is gone, and names survivors loudly; `clusters gc` also
+  sweeps for pods linked to clusters that no longer exist.
 
 Supported shapes: H100/H200/B200 (3200 Gbps interconnect) and A100
 (1600 Gbps), 2–8 nodes. Full API contract and live-probe findings:
