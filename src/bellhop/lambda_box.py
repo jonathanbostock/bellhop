@@ -504,13 +504,13 @@ async def instance(config: LambdaConfig, *, keep: bool = False,
         finally:
             if watchdog:
                 watchdog.cancel()
-            if keep and config.max_lifetime and not inst._lifetime_expired:
+            if (keep or inst.keep) and config.max_lifetime and not inst._lifetime_expired:
                 warnings.warn(
                     f"keep=True disarms the max_lifetime watchdog: instance {inst.id} "
                     "now has NO lifetime bound (reap with `bellhop lambda gc`)",
                     stacklevel=3,
                 )
-            if not keep:
+            if not (keep or inst.keep):
                 with contextlib.suppress(Exception):
                     await inst.teardown()
 

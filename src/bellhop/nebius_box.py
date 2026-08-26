@@ -482,13 +482,13 @@ async def vm(config: NebiusConfig, *, keep: bool = False) -> AsyncIterator[Nebiu
         finally:
             if watchdog:
                 watchdog.cancel()
-            if keep and config.max_lifetime and not box._lifetime_expired:
+            if (keep or box.keep) and config.max_lifetime and not box._lifetime_expired:
                 warnings.warn(
                     f"keep=True disarms the max_lifetime watchdog: vm {box.id} "
                     "now has NO lifetime bound (reap with `bellhop nebius gc`)",
                     stacklevel=3,
                 )
-            if not keep:
+            if not (keep or box.keep):
                 with contextlib.suppress(Exception):
                     await box.teardown()
     finally:

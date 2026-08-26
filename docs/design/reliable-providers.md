@@ -152,3 +152,36 @@ mechanism for both providers beats two), and `bellhop lambda|nebius gc
 --older-than-hours N [--dry-run]` terminates only bellhop-stamped boxes older
 than the threshold — a hand-made instance, or even a bellhop-named one
 without a parseable stamp, is never touched.
+
+## Field reports: what a real training campaign broke
+
+A 110B FSDP2 midtraining campaign (8×H200, ≥1.9TB host RAM) run on the RunPod
+backend surfaced seven failure modes, ranked here by dollars lost; each maps
+to a feature in this fork:
+
+1. **Teardown-on-failure destroyed state.** One failed upload invocation →
+   job exit 1 → teardown deleted the only copy of a 220GB checkpoint from a
+   finished 14h run. → `run(keep_on_failure=True)` and the `box.keep`
+   mid-session escape hatch (`keep=True` was all-or-nothing: it would also
+   have orphaned every rejected pod).
+2. **No host-quality filtering.** The same defective host was re-served 7+
+   times; RunPod schedules onto any host meeting the GPU ask regardless of
+   RAM. → `PodConfig(min_memory_gb=, min_vcpu=)` (GraphQL passthrough) and
+   `host_check=` with raise-to-reroll semantics.
+3. **Asymmetric network faults.** A host with fine download had a broken
+   6MB/s *upload* — invisible to any download-based preflight, fatal to
+   checkpoint publish. → `host_check` runs post-readiness, so upload probes
+   are just `pod.exec(...)`.
+4. **SIGHUP kills long jobs.** exec-over-ssh ties the job to the launcher's
+   life. → `exec_detached()` / `DetachedJob` (setsid + on-box exit file,
+   reattachable by name).
+5. **`.env` shipped to community pods.** `push()` tarred the raw tree. →
+   `.env*` in `TAR_EXCLUDES`.
+6. **The safety timer destroyed its own results.** A 2-node run was killed by
+   its own 3h `max_lifetime` *during the results pull*. → the watchdog grace
+   hook (`on_lifetime_expiry`): salvage-pull before teardown, bounded at
+   15 min so a wedged pull can't defeat the TTL.
+7. **Diagnostics evaporated.** `log_tail` is 2000 chars in an exception
+   nobody printed; RunPod's 401 body is literally `{"error":{}}`. →
+   `failure.log` persists every failing step's full output; auth errors name
+   the key, the header style, and the endpoint.

@@ -47,12 +47,12 @@ from .pod import GPU_ALIASES, IMAGE_PRESETS, Pod, PodConfig, pod
 from .probes import HttpProbe, LogMarkerProbe, ReadyProbe, SshProbe, TcpProbe
 from .rest import RunpodRest
 from .run import RunResult, RunSpec, run, run_many
-from .sshbox import SshBox
+from .sshbox import DetachedJob, SshBox
 
 __all__ = [
     # backend-agnostic surface
     "run", "run_many", "RunSpec", "RunResult",
-    "open_box", "ExecBox", "ExecResult", "SshBox", "call",
+    "open_box", "ExecBox", "ExecResult", "SshBox", "DetachedJob", "call",
     # RunPod backend
     "pod", "Pod", "PodConfig", "IMAGE_PRESETS", "GPU_ALIASES",
     "RunpodRest", "RunpodGraphQL",

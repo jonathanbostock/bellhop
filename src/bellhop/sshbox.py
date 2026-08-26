@@ -24,9 +24,11 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import os
+import re
 import shlex
 import sys
 import time
+import uuid
 from datetime import timedelta
 from pathlib import Path
 
@@ -64,6 +66,15 @@ class SshBox:
     ssh_user: str
     _ssh_key: str
     _noun = "box"          # how error messages name the box ("pod", "instance")
+    # Flip to True mid-session to convert this box to keep=True — the CM's
+    # teardown honors it. This is what makes failure-aware keeps composable:
+    # run(keep_on_failure=True) sets it when a job dies holding state, and
+    # user code can set it on any condition ("keep if the checkpoint marker
+    # exists") without threading a flag through the context manager.
+    keep = False
+    # Optional grace hook the lifetime watchdog awaits (bounded) before it
+    # tears the box down — run() points it at an emergency results pull.
+    on_lifetime_expiry = None
 
     def _ssh_endpoint(self) -> tuple[str, int]:
         raise NotImplementedError
@@ -150,6 +161,99 @@ class SshBox:
         """Run a local Python function on the box; see :func:`bellhop.call.call`."""
         from .call import call as _call
         return await _call(self, fn, *args, **kwargs)
+
+    async def exec_detached(self, cmd: str, env: dict[str, str] | None = None,
+                            name: str | None = None) -> "DetachedJob":
+        """Start command(s) on the box, detached from this SSH session.
+
+        ``exec()`` runs the remote command as a child of the ssh session — if
+        the *launcher* dies (laptop sleep, kill -9, network drop), sshd sends
+        the job SIGHUP and a 21-hour training run dies with it. This starts
+        the script under ``setsid`` with a wrapper that records the exit code,
+        returns immediately, and hands back a :class:`DetachedJob` you can
+        poll, tail, or ``wait()`` on — from this process or a later one
+        (``DetachedJob(box, name)`` reattaches by name).
+
+        Env vars are written into the job's script file (mode 700 dir) rather
+        than argv; stdout+stderr go to ``out.log`` in the job dir.
+        """
+        name = name or uuid.uuid4().hex[:12]
+        if not re.fullmatch(r"[A-Za-z0-9._-]+", name):
+            raise PreflightError(f"detached job name must be [A-Za-z0-9._-]+, got {name!r}")
+        job = DetachedJob(self, name)
+        exports = "\n".join(f"export {k}={shlex.quote(v)}" for k, v in (env or {}).items())
+        script = f"set -o pipefail\n{exports}\n{cmd}\n"
+        d = shlex.quote(job.dir)
+        eof = f"BELLHOP_EOF_{uuid.uuid4().hex[:8]}"
+        # exec() feeds this over stdin, so the quoted heredoc rides the same
+        # channel — the script (env values included) never appears in argv.
+        # The wrapper runs under setsid with all stdio detached: sshd's exit
+        # can't reach it, and `echo $? > exit` is the completion signal.
+        start = (
+            f"mkdir -p {d} && chmod 700 {d} && cat > {d}/script.sh << '{eof}'\n"
+            f"{script}{eof}\n"
+            f"setsid bash -c {shlex.quote(f'bash {job.dir}/script.sh > {job.dir}/out.log 2>&1 < /dev/null; echo $? > {job.dir}/exit')} "
+            f"> /dev/null 2>&1 < /dev/null & echo $! > {d}/pid"
+        )
+        res = await self.exec(start)
+        if res.exit_code != 0:
+            raise RuntimeError(
+                f"exec_detached failed to start job {name!r} on {self._noun} {self.id} "
+                f"(rc={res.exit_code}): {(res.stderr or res.stdout)[-500:]}")
+        return job
+
+
+DETACHED_DIR = "/tmp/bellhop-jobs"
+
+# How long the watchdog's on_lifetime_expiry grace hook may run before the
+# teardown proceeds anyway.
+LIFETIME_GRACE_SECONDS = 900.0
+
+
+class DetachedJob:
+    """Handle to a detached remote job (see :meth:`SshBox.exec_detached`).
+
+    Stateless on the client: everything lives in the job dir on the box
+    (``script.sh``, ``out.log``, ``pid``, and ``exit`` once finished), so a
+    fresh process can reattach with ``DetachedJob(box, name)`` and ``wait()``.
+    """
+
+    def __init__(self, box: SshBox, name: str):
+        self.box = box
+        self.name = name
+        self.dir = f"{DETACHED_DIR}/{name}"
+
+    async def exit_code(self) -> int | None:
+        """The job's exit code, or None while it is still running."""
+        res = await self.box._ssh_raw(f"cat {shlex.quote(self.dir)}/exit 2>/dev/null")
+        text = res.stdout.strip()
+        return int(text) if res.exit_code == 0 and text else None
+
+    async def running(self) -> bool:
+        return await self.exit_code() is None
+
+    async def tail(self, n: int = 50) -> str:
+        res = await self.box._ssh_raw(f"tail -n {int(n)} {shlex.quote(self.dir)}/out.log 2>/dev/null")
+        return res.stdout
+
+    async def wait(self, poll: float = 15.0, timeout: float | None = None) -> ExecResult:
+        """Poll until the job finishes; returns its exit code + log tail.
+
+        Like ``exec()``, unbounded by default; a finite ``timeout`` raises
+        :class:`ExecTimeoutError` (the remote job keeps running — it is
+        detached; that's the point).
+        """
+        deadline = time.monotonic() + timeout if timeout is not None else None
+        while True:
+            code = await self.exit_code()
+            if code is not None:
+                return ExecResult(code, await self.tail(200), "")
+            if deadline is not None and time.monotonic() >= deadline:
+                raise ExecTimeoutError(
+                    f"detached job {self.name!r} still running after {timeout:.0f}s "
+                    f"on {self.box._noun} {self.box.id} (it keeps running; "
+                    "reattach with DetachedJob(box, name))")
+            await asyncio.sleep(poll)
 
 
 async def _communicate(proc, stdin: bytes | None = None, timeout: float = 600):
@@ -238,6 +342,17 @@ async def lifetime_watchdog(box, lifetime: timedelta) -> None:
     box._lifetime_expired = True
     print(f"bellhop: {box._noun} {box.id} hit max_lifetime {lifetime} — tearing down",
           file=sys.stderr, flush=True)
+    # Grace hook: salvage what the box holds before destroying it. run()
+    # points this at an emergency results pull — losing a run to its own
+    # safety timer DURING the results phase is the worst possible trade.
+    # Bounded so a wedged pull can't defeat the TTL entirely.
+    grace = getattr(box, "on_lifetime_expiry", None)
+    if grace is not None:
+        try:
+            await asyncio.wait_for(grace(), LIFETIME_GRACE_SECONDS)
+        except Exception as e:
+            print(f"bellhop: max_lifetime grace hook failed on {box._noun} {box.id}: {e}",
+                  file=sys.stderr, flush=True)
     for attempt in range(3):
         try:
             await box.teardown()

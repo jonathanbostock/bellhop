@@ -28,9 +28,14 @@ from typing import AsyncIterator, Protocol, runtime_checkable
 
 from .errors import PreflightError
 
-# What push() leaves out of the codebase archive, on either backend.
+# What push() leaves out of the codebase archive, on every backend. The
+# .env* patterns are a credential firewall, not tidiness: a repo-root .env
+# full of API keys must never land on a (possibly community-hosted) box.
+# Ship box-side secrets explicitly via exec(env=...) / RunSpec(env=...),
+# which never touch the box's disk or argv.
 TAR_EXCLUDES = ["--exclude=.git", "--exclude=__pycache__", "--exclude=.venv",
-                "--exclude=node_modules", "--exclude=*.pyc"]
+                "--exclude=node_modules", "--exclude=*.pyc",
+                "--exclude=.env", "--exclude=.env.*"]
 
 
 @dataclass

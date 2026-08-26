@@ -13,7 +13,7 @@ import time
 import warnings
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
-from typing import AsyncIterator, Literal
+from typing import AsyncIterator, Awaitable, Callable, Literal
 
 from .errors import PodNotReadyError, PreflightError, ProvisionError
 from .graphql import RunpodGraphQL
@@ -111,6 +111,19 @@ class PodConfig:
     # auth / connection
     ssh_key: str | None = None             # private key; default ~/.ssh/id_ed25519
     ssh_user: str = "root"
+    # Host-quality floors (GraphQL create path, GPU pods only). RunPod
+    # schedules onto any host satisfying the GPU ask; a 110B FSDP run that
+    # needs 1.9TB host RAM can land on a 512GB machine without these.
+    min_memory_gb: int | None = None       # GraphQL minMemoryInGb
+    min_vcpu: int | None = None            # GraphQL minVcpuCount
+    # Post-readiness host acceptance check: async callable(pod) -> None that
+    # RAISES to reject this host — the pod is torn down and provisioning
+    # rerolls (up to host_check_retries). The pod is functional when called,
+    # so checks can exec: IP blocklists, upload-bandwidth probes (a host with
+    # fine download and a broken 6MB/s upload passes every download test and
+    # then fails your checkpoint publish), nvme smoke tests, ...
+    host_check: "Callable[[Pod], Awaitable[None]] | None" = None
+    host_check_retries: int = 3
     # readiness. Defaults resolve in __post_init__: 300s/420s normally, but
     # 1200s each when docker_start_cmd is set — a bootstrap that apt-installs
     # its way to sshd routinely needs 5-15 min before the pod is reachable,
@@ -210,6 +223,14 @@ class PodConfig:
     def has_ttl(self) -> bool:
         return bool(self.stop_after or self.terminate_after)
 
+    def has_host_floor(self) -> bool:
+        return bool(self.min_memory_gb or self.min_vcpu)
+
+    def needs_graphql(self) -> bool:
+        """REST v1 has neither TTL nor host-floor fields; either routes create
+        through GraphQL (which handles both, TTL or not)."""
+        return self.has_ttl() or self.has_host_floor()
+
     def to_graphql_input(self, gpu_type_id: str | None = None) -> dict:
         """Input for podFindAndDeployOnDemand — the only create path with TTL.
 
@@ -236,6 +257,10 @@ class PodConfig:
             inp["dockerArgs"] = f"bash -c {shlex.quote(self.docker_start_cmd)}"
         if self.cuda_versions:
             inp["allowedCudaVersions"] = list(self.cuda_versions)
+        if self.min_memory_gb:
+            inp["minMemoryInGb"] = self.min_memory_gb
+        if self.min_vcpu:
+            inp["minVcpuCount"] = self.min_vcpu
         if self.volume_gb:
             inp["volumeInGb"] = self.volume_gb
             inp["volumeMountPath"] = self.volume_mount_path
@@ -347,53 +372,88 @@ async def _gql_create(config: PodConfig, api_key: str | None) -> dict:
         )
 
 
+async def _create(rest: RunpodRest, config: PodConfig, api_key: str | None) -> str:
+    """One create call (GraphQL or REST as the config demands) -> pod id."""
+    if config.needs_graphql() and config.resolved_compute == "gpu":
+        # Native server-side TTL and the host floors are GraphQL-only
+        # (and on-demand = GPU only).
+        created = await _gql_create(config, api_key)
+    else:
+        if config.has_ttl():
+            warnings.warn(
+                "server-side TTL (stop_after/terminate_after/max_lifetime) is "
+                "GPU-only on RunPod; this CPU pod gets NO native timer — if this "
+                "process dies, nothing tears the pod down",
+                stacklevel=2,
+            )
+        if config.has_host_floor():
+            warnings.warn(
+                "min_memory_gb/min_vcpu are GPU-only on RunPod (GraphQL create "
+                "path); this CPU pod's host floors are dropped",
+                stacklevel=2,
+            )
+        body = config.to_create_body()
+        try:
+            created = await rest.create_pod(body)
+        except ProvisionError as first:
+            if config.cloud == "COMMUNITY" and config.cloud_fallback:
+                body["cloudType"] = "SECURE"
+                try:
+                    created = await rest.create_pod(body)
+                except ProvisionError as second:
+                    raise ProvisionError(
+                        f"create failed on COMMUNITY ({first}) "
+                        f"and on the SECURE fallback ({second})"
+                    ) from second
+            else:
+                raise
+    pod_id = created.get("id") or created.get("pod", {}).get("id")
+    if not pod_id:
+        raise ProvisionError(f"could not parse pod id from create response: {created}")
+    return pod_id
+
+
 @contextlib.asynccontextmanager
 async def pod(config: PodConfig, *, keep: bool = False,
               api_key: str | None = None) -> AsyncIterator[Pod]:
     """Provision a pod, wait until it's functional, yield it, tear it down.
 
     On any exception (including a readiness timeout) the pod is still deleted,
-    unless ``keep=True``.
+    unless ``keep=True`` — or unless the body set ``p.keep = True``, the
+    mid-session escape hatch (run() uses it for ``keep_on_failure``).
+
+    With ``config.host_check`` set, a rejected host (the check raising) tears
+    that pod down — regardless of ``keep`` — and re-provisions, up to
+    ``host_check_retries`` rerolls: RunPod happily re-serves known-bad hosts,
+    so "reject and reroll" is the only lever a client has.
     """
     async with RunpodRest(api_key=api_key) as rest:
-        if config.has_ttl() and config.resolved_compute == "gpu":
-            # Native server-side TTL is GraphQL-only (and on-demand = GPU only).
-            created = await _gql_create(config, api_key)
-        else:
-            if config.has_ttl():
-                warnings.warn(
-                    "server-side TTL (stop_after/terminate_after/max_lifetime) is "
-                    "GPU-only on RunPod; this CPU pod gets NO native timer — if this "
-                    "process dies, nothing tears the pod down",
-                    stacklevel=2,
-                )
-            body = config.to_create_body()
+        rerolls = config.host_check_retries if config.host_check else 0
+        rejections: list[str] = []
+        for attempt in range(rerolls + 1):
+            p = Pod(rest, await _create(rest, config, api_key), config)
             try:
-                created = await rest.create_pod(body)
-            except ProvisionError as first:
-                if config.cloud == "COMMUNITY" and config.cloud_fallback:
-                    body["cloudType"] = "SECURE"
+                await p._wait_provision()
+                await p._wait_ready()
+                if config.host_check:
                     try:
-                        created = await rest.create_pod(body)
-                    except ProvisionError as second:
+                        await config.host_check(p)
+                    except Exception as e:
+                        rejections.append(f"pod {p.id} on {p.host}: {e}")
+                        # a rejected host is torn down even under keep=True —
+                        # nobody wants to keep the pod they just rejected
+                        with contextlib.suppress(Exception):
+                            await p.teardown()
+                        if attempt < rerolls:
+                            continue
                         raise ProvisionError(
-                            f"create failed on COMMUNITY ({first}) "
-                            f"and on the SECURE fallback ({second})"
-                        ) from second
-                else:
-                    raise
-        pod_id = created.get("id") or created.get("pod", {}).get("id")
-        if not pod_id:
-            raise ProvisionError(f"could not parse pod id from create response: {created}")
-
-        p = Pod(rest, pod_id, config)
-        try:
-            await p._wait_provision()
-            await p._wait_ready()
-            if config.pip:
-                await install_pip(p, config.pip)
-            yield p
-        finally:
-            if not keep:
-                with contextlib.suppress(Exception):
-                    await p.teardown()
+                            f"host_check rejected every host ({rerolls + 1} attempts):\n  "
+                            + "\n  ".join(rejections))
+                if config.pip:
+                    await install_pip(p, config.pip)
+                yield p
+                return
+            finally:
+                if not (keep or p.keep):
+                    with contextlib.suppress(Exception):
+                        await p.teardown()

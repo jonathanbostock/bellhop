@@ -303,6 +303,13 @@ async def _lifetime_watchdog(clu: Cluster, gql: RunpodGraphQL, rest: RunpodRest,
     import sys
     print(f"bellhop: cluster {clu.id} hit max_lifetime {lifetime} — tearing down",
           file=sys.stderr, flush=True)
+    # Grace hook: salvage rank 0's results before destruction (run_cluster
+    # sets it) — a run once died to its own 3h timer DURING the results pull.
+    grace = getattr(clu, "on_lifetime_expiry", None)
+    if grace is not None:
+        with contextlib.suppress(Exception):
+            from .sshbox import LIFETIME_GRACE_SECONDS
+            await asyncio.wait_for(grace(), LIFETIME_GRACE_SECONDS)
     with contextlib.suppress(Exception):
         await _delete_cluster(gql, rest, clu.id, [p.id for p in clu.nodes])
 
@@ -374,6 +381,12 @@ async def run_cluster(spec: RunSpec, config: ClusterConfig, *,
     results_remote = f"{run_dir}/{spec.results_subdir}"
 
     async with cluster(config, api_key=api_key) as clu:
+        # Salvage rank 0's results if the max_lifetime watchdog fires mid-run.
+        async def _salvage():
+            if await clu.primary.exists_remote(results_remote):
+                await clu.pull(results_remote, local_out)
+        clu.on_lifetime_expiry = _salvage
+
         await clu.exec_all(f"mkdir -p {shlex.quote(run_dir)}")
         await clu.push_all(spec.codebase, run_dir)
         job_results = await clu.exec_all(_job_script(spec, run_dir),

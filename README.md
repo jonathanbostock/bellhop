@@ -128,10 +128,22 @@ Good to know:
   running the job on a half-configured box.
 - If the job step times out (opt-in `timeout=`), bellhop still pulls whatever
   landed in `results/` before raising, so the run stays debuggable.
+- **`keep_on_failure=True`** (`--keep-on-failure`) leaves the box up when the
+  job fails, times out, or the pull dies — a failed 14-hour run's checkpoint
+  is worth more than the hourly rate. The box id is printed; it keeps billing
+  until you tear it down. Boxes rejected before the job (provisioning,
+  `host_check`) are still cleaned up. Programmatic version: set
+  `box.keep = True` from anywhere ("keep if the checkpoint marker exists").
+- Every failing step's **full** output lands in `<local_out>/failure.log`
+  (`RemoteJobError.log_tail` is a 2000-char courtesy copy, not the record).
 - GCS upload happens from *your* machine — cloud credentials never touch the
   box. Needs `gcloud` on your PATH.
 - Jobs live under `/workspace/<slug>` on every backend — the SSH backends
   bootstrap a user-owned `/workspace` before yielding the box.
+- `push()` excludes `.git`, `.venv`, caches — and **`.env*`**: a repo-root
+  `.env` full of keys must never land on a (possibly community-hosted) box.
+  Ship secrets via `RunSpec(env=...)` / `exec(env=...)`, which stay off the
+  box's disk and argv.
 
 ### Big data on the box: pair with ferry
 
@@ -190,6 +202,56 @@ async with vm(NebiusConfig(gpu="H200", gpu_count=8)) as v: ...  # Nebius
 yielding the box. The default (`SshProbe("true")`) suits ssh job boxes; for
 servers use `HttpProbe(8000, "/health")` or `LogMarkerProbe("server up")`.
 (Modal sandboxes are execable as soon as `create()` returns — no probe step.)
+
+### Detached jobs: surviving your own death
+
+`exec()` runs the remote command as a child of the ssh session — if the
+*launcher* dies (laptop sleep, kill -9, network drop), sshd SIGHUPs the job
+and a 21-hour training run dies with it. For anything long, start it
+detached:
+
+```python
+async with pod(PodConfig(gpu="H100"), keep=True) as p:
+    job = await p.exec_detached("cd /workspace/job && python train.py",
+                                env={"HF_TOKEN": tok}, name="midtrain")
+# ... laptop sleeps, process dies, whatever ...
+
+# later, from a fresh process:
+from bellhop import DetachedJob
+async with pod(existing_or_new, keep=True) as p:   # or any live box handle
+    job = DetachedJob(p, "midtrain")               # reattach by name
+    print(await job.running(), await job.tail(20))
+    res = await job.wait()                         # exit code + log tail
+```
+
+The job runs under `setsid` with its output in `/tmp/bellhop-jobs/<name>/`;
+the handle is stateless, so any process that can reach the box can poll,
+tail, or wait. Works on all three SSH backends.
+
+### Picky about hosts: floors and rejection (RunPod)
+
+RunPod schedules onto any host satisfying the GPU ask — which can mean a
+512GB-RAM machine for your 1.9TB FSDP run, or the same defective host served
+back seven times. Two levers:
+
+```python
+PodConfig(
+    gpu="H200", gpu_count=8,
+    min_memory_gb=1900, min_vcpu=96,     # host floors (GraphQL create path)
+    host_check=my_check,                 # post-ready acceptance check
+    host_check_retries=3,
+)
+
+async def my_check(pod):                 # raise to REJECT the host and reroll
+    if pod.host in KNOWN_BAD_IPS:
+        raise RuntimeError(f"blocklisted host {pod.host}")
+    up = await pod.exec("dd if=/dev/zero bs=1M count=256 | gsutil cp - gs://bkt/probe && ...")
+    if too_slow(up):                     # asymmetric faults are real: fine download,
+        raise RuntimeError("upload 6MB/s")   # broken upload — only an upload probe sees it
+```
+
+A rejected host is torn down (even under `keep=True`) and provisioning
+rerolls; exhaustion raises `ProvisionError` listing every rejection.
 
 ## Remote function calls
 
@@ -348,8 +410,12 @@ The context manager is the primary guarantee; the timers cover the one case
   *in-process* watchdog: it terminates the box when it fires (a mid-run kill
   surfaces as a clear "hit max_lifetime" error, not a mystery ssh failure),
   but it dies with your process, and `keep=True` disarms it (bellhop warns
-  loudly in both cases). The real backstop is the reaper — bellhop stamps
-  every launch's name with `-t<epoch>` so leaks are findable:
+  loudly in both cases). Before destroying the box, the watchdog runs a
+  bounded **grace hook** — `run()` points it at an emergency results pull, so
+  a run can't be lost to its own safety timer during the results phase (the
+  cluster watchdog does the same for rank 0). The real backstop is the
+  reaper — bellhop stamps every launch's name with `-t<epoch>` so leaks are
+  findable:
 
   ```bash
   bellhop lambda list                                # everything, yours or not

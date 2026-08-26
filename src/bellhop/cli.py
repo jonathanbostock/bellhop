@@ -35,6 +35,9 @@ def _parser() -> argparse.ArgumentParser:
     r.add_argument("--no-gcs", action="store_true", help="skip GCS upload")
     r.add_argument("--env-json", default=None, help="JSON object of extra box env vars")
     r.add_argument("--keep-pod", action="store_true", help="leave the box up after the run")
+    r.add_argument("--keep-on-failure", action="store_true",
+                   help="leave the box up only when the job fails (its state is usually "
+                        "worth more than the hourly rate); it keeps billing until you kill it")
     r.add_argument("--gpu", default=None,
                    help="GPU short name, e.g. 'A100', 'H100', 'L4' (all backends; omit for a CPU box "
                         "— NB Lambda is GPU-only). Verbatim provider ids also pass: a RunPod "
@@ -51,6 +54,9 @@ def _parser() -> argparse.ArgumentParser:
     r.add_argument("--gpu-id", default=None, help="[deprecated] verbatim RunPod gpuTypeId; use --gpu")
     r.add_argument("--container-disk-gb", type=int, default=20)
     r.add_argument("--cloud", choices=["SECURE", "COMMUNITY"], default="COMMUNITY")
+    r.add_argument("--min-memory-gb", type=int, default=None,
+                   help="RunPod: host RAM floor in GB (GPU pods; e.g. 1900 for a 110B FSDP run)")
+    r.add_argument("--min-vcpu", type=int, default=None, help="RunPod: host vCPU floor")
     r.add_argument("--ready-timeout", type=int, default=None,
                    help="seconds to wait for the readiness probe (default: each backend's own)")
     # Modal-specific
@@ -140,6 +146,8 @@ def _build_backend(args, env: dict):
         image_preset=args.image_preset,
         container_disk_gb=args.container_disk_gb,
         cloud=args.cloud,
+        min_memory_gb=args.min_memory_gb,
+        min_vcpu=args.min_vcpu,
         pip=list(args.pip or []),
         env=dict(env),
         max_lifetime=max_lifetime,
@@ -238,7 +246,8 @@ def main(argv: list[str] | None = None) -> int:
     )
 
     try:
-        res = asyncio.run(run(spec, backend, keep_pod=args.keep_pod))
+        res = asyncio.run(run(spec, backend, keep_pod=args.keep_pod,
+                              keep_on_failure=args.keep_on_failure))
     except BellhopError as e:
         print(f"ERROR [{type(e).__name__}]: {e}", file=sys.stderr)
         return e.exit_code
