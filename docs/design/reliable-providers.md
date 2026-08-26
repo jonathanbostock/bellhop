@@ -191,9 +191,22 @@ to a feature in this fork:
    spend saturated the account's spend cap, which then masqueraded as a
    capacity drought for unrelated creates). → `_delete_cluster` treats the
    mutation as advisory: per-pod delete + three verify rounds + survivors
-   named LOUDLY on stderr; and `bellhop clusters gc` gained an orphan sweep
-   that reaps pods whose REST record links them to a cluster that no longer
-   exists (exact linkage match, never name/timestamp heuristics — a
-   hand-made pod can't be misidentified). Corollary for debugging: when
-   creates suddenly fail "for capacity", check the account spend cap and
-   sweep for orphans first.
+   named LOUDLY on stderr; and `bellhop clusters gc` gained an orphan sweep.
+   Corollary for debugging: when creates suddenly fail "for capacity", check
+   the account spend cap and sweep for orphans first.
+9. **REST pod records carry no cluster linkage.** A live probe of
+   `GET /v1/pods` (2026-08-26) shows a pod's complete key set has nothing
+   cluster-ish in it — so once the cluster object is gone, RunPod cannot say
+   which pods were members, and the first field-hit orphans were only
+   identified by hand. → membership is persisted at create time (the
+   `createCluster` response includes `pods { id }`) to a local JSONL ledger
+   in XDG *state* (not cache — wiping a cache must never lose the only
+   record of billing pods). The gc orphan sweep is ledger-driven and exact:
+   dead cluster + listed pod still alive → reap at any age; an entry is
+   dropped only once a round verifies every pod gone. Teardown narrows the
+   entry to survivors (or drops it when clean), and gc adopts survivors of
+   clusters it age-reaps, so even foreign clusters get covered once this
+   machine has touched them. The old REST-linkage read stays as
+   belt-and-braces — member pods *might* carry a field regular pods omit
+   (unconfirmed; a live cluster is needed to check) — but nothing relies on
+   it, and there are still no name/timestamp heuristics.

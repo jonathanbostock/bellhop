@@ -345,9 +345,12 @@ Cluster-specific behavior to know about:
   a client-side `max_lifetime` watchdog. Sweep up leaks with
   `bellhop clusters list` / `bellhop clusters gc --older-than-hours 24`.
 - **RunPod's `deleteCluster` can orphan member pods** (cluster object gone,
-  pods still billing). bellhop's teardown deletes every member pod directly,
-  verifies each is gone, and names survivors loudly; `clusters gc` also
-  sweeps for pods linked to clusters that no longer exist.
+  pods still billing — and the API keeps no record of which pods were
+  members). bellhop's teardown deletes every member pod directly, verifies
+  each is gone, and names survivors loudly. Membership is also persisted at
+  create time to a local ledger (`~/.local/state/bellhop/clusters.jsonl`,
+  override with `BELLHOP_CLUSTER_LEDGER`), so `clusters gc` reaps a dead
+  cluster's leftover pods exactly, at any age, even after a crash.
 
 Supported shapes: H100/H200/B200 (3200 Gbps interconnect) and A100
 (1600 Gbps), 2–8 nodes. Full API contract and live-probe findings:

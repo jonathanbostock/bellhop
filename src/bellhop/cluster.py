@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import json
 import os
 import re
 import shlex
@@ -314,6 +315,75 @@ async def _lifetime_watchdog(clu: Cluster, gql: RunpodGraphQL, rest: RunpodRest,
         await _delete_cluster(gql, rest, clu.id, [p.id for p in clu.nodes])
 
 
+# ---- membership ledger -------------------------------------------------------
+# RunPod's REST pod records carry NO cluster linkage (live-probed 2026-08-26:
+# a pod's complete key set has nothing cluster-ish in it), so once deleteCluster
+# kills the cluster OBJECT its orphaned member pods are unattributable via the
+# API. The only exact record of membership is createCluster's own response —
+# persist it locally at birth, and let gc reap from it. Lives in XDG *state*,
+# not cache: wiping a cache must never lose the only record of billing pods.
+
+_LEDGER_ENV = "BELLHOP_CLUSTER_LEDGER"
+
+
+def _ledger_path() -> Path:
+    if os.environ.get(_LEDGER_ENV):
+        return Path(os.environ[_LEDGER_ENV]).expanduser()
+    state = Path(os.environ.get("XDG_STATE_HOME") or "~/.local/state").expanduser()
+    return state / "bellhop" / "clusters.jsonl"
+
+
+def _ledger_record(cluster_id: str, pod_ids: list[str], name: str) -> None:
+    """Append a membership record (last write per cluster wins on load).
+
+    Failure is non-fatal — the cluster is already billing and must proceed —
+    but LOUD, because it means gc cannot see these pods if teardown orphans
+    them.
+    """
+    from datetime import datetime, timezone
+    try:
+        path = _ledger_path()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open("a") as f:
+            f.write(json.dumps({"cluster_id": cluster_id, "pod_ids": pod_ids,
+                                "name": name,
+                                "created": datetime.now(timezone.utc).isoformat()}) + "\n")
+    except OSError as e:
+        print(f"bellhop: could not record cluster {cluster_id} in {_ledger_path()} "
+              f"({e}) — `bellhop clusters gc` will NOT see its pods if teardown "
+              f"orphans them; note these ids: {', '.join(pod_ids)}",
+              file=sys.stderr, flush=True)
+
+
+def _ledger_load() -> list[dict[str, Any]]:
+    try:
+        raw = _ledger_path().read_text()
+    except OSError:
+        return []
+    entries: dict[str, dict[str, Any]] = {}
+    for line in raw.splitlines():
+        with contextlib.suppress(Exception):    # tolerate torn/foreign lines
+            entry = json.loads(line)
+            entries[entry["cluster_id"]] = entry
+    return list(entries.values())
+
+
+def _ledger_forget(cluster_id: str) -> None:
+    """Drop one cluster's record — call only once every pod is verified gone.
+
+    Best-effort compaction: a concurrent writer can race the rewrite, and the
+    worst case is a stale entry whose pods the next gc re-verifies as gone.
+    """
+    with contextlib.suppress(OSError):
+        path = _ledger_path()
+        if not path.exists():
+            return
+        entries = [e for e in _ledger_load() if e["cluster_id"] != cluster_id]
+        tmp = path.with_suffix(".tmp")
+        tmp.write_text("".join(json.dumps(e) + "\n" for e in entries))
+        tmp.replace(path)
+
+
 async def _delete_cluster(gql: RunpodGraphQL, rest: RunpodRest,
                           cluster_id: str, pod_ids: list[str]) -> list[str]:
     """deleteCluster, then verify the cascade; fall back to per-pod deletes.
@@ -370,6 +440,9 @@ async def cluster(config: ClusterConfig, *, api_key: str | None = None):
     try:
         created = await _create_with_bid(gql, config)
         pod_ids = [p["id"] for p in created["pods"]]
+        # ledger BEFORE any await that can fail: a crash between create and
+        # here would leave pods only the RunPod console can attribute
+        _ledger_record(created["id"], pod_ids, config.name)
         try:
             node_cfg = config._node_pod_config()
             pods = [Pod(rest, pid, node_cfg) for pid in pod_ids]
@@ -384,7 +457,11 @@ async def cluster(config: ClusterConfig, *, api_key: str | None = None):
             finally:
                 watchdog.cancel()
         finally:
-            await _delete_cluster(gql, rest, created["id"], pod_ids)
+            survivors = await _delete_cluster(gql, rest, created["id"], pod_ids)
+            if survivors:   # narrow the entry so gc re-checks only what's left
+                _ledger_record(created["id"], survivors, config.name)
+            else:
+                _ledger_forget(created["id"])
     finally:
         await gql.aclose()
         await rest.aclose()
@@ -451,7 +528,9 @@ async def list_clusters(api_key: str | None = None) -> list[dict[str, Any]]:
 
 async def gc_clusters(older_than: timedelta, *, api_key: str | None = None,
                       dry_run: bool = False) -> list[dict[str, Any]]:
-    """Reap clusters older than ``older_than`` (the missing server-side TTL)."""
+    """Reap clusters older than ``older_than`` (the missing server-side TTL),
+    plus — at any age — member pods orphaned by a dead cluster object, using
+    the local membership ledger (see ``_ledger_record``)."""
     from datetime import datetime, timezone
 
     def _parse_created(raw: str) -> datetime:
@@ -466,21 +545,48 @@ async def gc_clusters(older_than: timedelta, *, api_key: str | None = None,
             age = datetime.now(timezone.utc) - _parse_created(clu["createdAt"])
             if age >= older_than:
                 if not dry_run:
-                    await _delete_cluster(gql, rest, clu["id"],
-                                          [p["id"] for p in clu.get("pods") or []])
+                    survivors = await _delete_cluster(
+                        gql, rest, clu["id"], [p["id"] for p in clu.get("pods") or []])
+                    if survivors:   # adopt into the ledger even if created elsewhere
+                        _ledger_record(clu["id"], survivors, clu.get("name", "?"))
+                    else:
+                        _ledger_forget(clu["id"])
                 reaped.append({**clu, "age_hours": round(age.total_seconds() / 3600, 2)})
-        # Orphan sweep: deleteCluster can kill the cluster OBJECT and leave
-        # its member pods running (see _delete_cluster) — and once the object
-        # is gone, the cluster list above can't see them at all. A member pod
-        # carries its cluster linkage in the REST record, so a pod pointing
-        # at a cluster that no longer exists is exact-match garbage (its
-        # rendezvous peer group is gone) and is reaped regardless of
-        # older_than. No name/timestamp heuristics: if RunPod's REST stops
-        # reporting the linkage, this sweep quietly finds nothing.
+        # Orphan sweep: deleteCluster can kill the cluster OBJECT and leave its
+        # member pods running (see _delete_cluster) — and once the object is
+        # gone, RunPod cannot say which pods were members (live-probed: REST
+        # pod records carry no cluster field). The exact record is our own
+        # create-time ledger: every entry whose cluster no longer exists is
+        # checked pod-by-pod, ignoring older_than — its rendezvous peer group
+        # is gone, so it is garbage at any age. An entry is dropped only once
+        # a round finds every listed pod already dead.
         live = {clu["id"] for clu in data["myself"]["clusters"]}
+        swept: set[str] = set()
+        for entry in _ledger_load():
+            if entry["cluster_id"] in live:
+                continue
+            found_alive = False
+            for pid in entry["pod_ids"]:
+                try:
+                    pd = await rest.get_pod(pid)
+                except Exception:
+                    continue          # already dead — the normal case
+                found_alive = True
+                swept.add(pid)
+                if not dry_run:
+                    with contextlib.suppress(Exception):
+                        await rest.delete_pod(pid)
+                reaped.append({"id": pid, "orphaned_pod_of": entry["cluster_id"],
+                               "name": pd.get("name", "?")})
+            if not dry_run and not found_alive:
+                _ledger_forget(entry["cluster_id"])
+        # Belt-and-braces: the regular-pod probe can't rule out cluster MEMBER
+        # pods carrying a linkage field regular pods omit. If they do, this
+        # also catches orphans other machines' ledgers know about; if not, it
+        # quietly finds nothing.
         for pd in await rest.list_pods():
             linked = pd.get("clusterId") or pd.get("instantClusterId")
-            if not linked or linked in live:
+            if not linked or linked in live or pd["id"] in swept:
                 continue
             if not dry_run:
                 with contextlib.suppress(Exception):

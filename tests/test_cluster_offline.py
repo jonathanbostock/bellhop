@@ -19,6 +19,14 @@ def _cfg(tmp_path, **kw):
     return ClusterConfig(**kw)
 
 
+@pytest.fixture(autouse=True)
+def ledger_path(tmp_path, monkeypatch):
+    """Every test gets a private membership ledger, never the real XDG one."""
+    path = tmp_path / "clusters.jsonl"
+    monkeypatch.setenv("BELLHOP_CLUSTER_LEDGER", str(path))
+    return path
+
+
 # ---- config → CreateClusterInput mapping -----------------------------------
 
 def test_input_shape(tmp_path):
@@ -222,55 +230,233 @@ def test_delete_cluster_names_unkillable_pods_loudly(monkeypatch, capsys):
     assert "RUNNING AND BILLING" in err and "p1" in err
 
 
-def test_gc_orphan_sweep_reaps_pods_of_dead_clusters(monkeypatch):
+class _GcGql:
+    """Constructor stand-in AND instance: gc calls RunpodGraphQL(api_key)."""
+
+    def __init__(self, clusters):
+        self.clusters = clusters
+
+    def __call__(self, api_key=None):
+        return self
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *exc):
+        pass
+
+    async def _post(self, q, v):
+        return {"myself": {"clusters": self.clusters}}
+
+
+class _GcRest:
+    def __init__(self, alive=(), undeletable=(), linkage=None):
+        self.alive = set(alive)
+        self.undeletable = set(undeletable)
+        self.linkage = linkage or {}        # pod id -> REST clusterId field
+        self.deleted = []
+
+    def __call__(self, api_key=None):
+        return self
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *exc):
+        pass
+
+    async def get_pod(self, pid):
+        if pid in self.alive:
+            return {"id": pid, "name": f"n-{pid}"}
+        raise RuntimeError("404")
+
+    async def delete_pod(self, pid):
+        self.deleted.append(pid)
+        if pid not in self.undeletable:
+            self.alive.discard(pid)
+
+    async def list_pods(self):
+        return [{"id": pid, "name": f"n-{pid}",
+                 **({"clusterId": self.linkage[pid]} if pid in self.linkage else {})}
+                for pid in sorted(self.alive)]
+
+
+def _patch_gc(monkeypatch, gql, rest):
     import importlib
 
     clumod = importlib.import_module("bellhop.cluster")
+    monkeypatch.setattr(clumod, "RunpodGraphQL", gql)
+    monkeypatch.setattr(clumod, "RunpodRest", rest)
+    return clumod
 
-    class _Gql:
-        def __init__(self, api_key=None):
-            pass
 
-        async def __aenter__(self):
-            return self
+_LIVE_C = {"id": "live-c", "name": "live", "createdAt": "2026-08-26T00:00:00Z",
+           "gpuTypeId": "NVIDIA H200", "podCount": 2, "pods": []}
+_FAR = timedelta(hours=10_000)   # threshold so live clusters are never age-reaped
 
-        async def __aexit__(self, *exc):
-            pass
 
-        async def _post(self, q, v):
-            return {"myself": {"clusters": [
-                {"id": "live-c", "createdAt": "2026-08-26T00:00:00Z",
-                 "gpuTypeId": "NVIDIA H200", "podCount": 2, "pods": []}]}}
+def test_ledger_roundtrip(ledger_path):
+    from bellhop.cluster import _ledger_forget, _ledger_load, _ledger_record
 
-    deleted = []
+    _ledger_record("c1", ["a", "b"], "one")
+    _ledger_record("c2", ["c"], "two")
+    _ledger_record("c1", ["b"], "one")           # narrowing append: last write wins
+    entries = {e["cluster_id"]: e for e in _ledger_load()}
+    assert entries["c1"]["pod_ids"] == ["b"]
+    assert entries["c2"]["pod_ids"] == ["c"]
+    _ledger_forget("c1")
+    assert [e["cluster_id"] for e in _ledger_load()] == ["c2"]
+    with open(ledger_path, "a") as f:            # torn/foreign lines are tolerated
+        f.write("{not json\n")
+    assert [e["cluster_id"] for e in _ledger_load()] == ["c2"]
 
-    class _Rest:
-        def __init__(self, api_key=None):
-            pass
 
-        async def __aenter__(self):
-            return self
+def test_gc_ledger_sweep_reaps_then_prunes(monkeypatch):
+    # The exact orphan record is OUR ledger (REST pods carry no cluster field):
+    # a dead cluster's still-alive pods are reaped at any age; the entry is
+    # dropped only once a later round verifies every pod gone.
+    rest = _GcRest(alive={"o1"})
+    clumod = _patch_gc(monkeypatch, _GcGql([_LIVE_C]), rest)
+    clumod._ledger_record("dead-c", ["o1", "o2"], "gone")
 
-        async def __aexit__(self, *exc):
-            pass
+    reaped = asyncio.run(clumod.gc_clusters(_FAR))
+    assert [r["id"] for r in reaped] == ["o1"]
+    assert reaped[0]["orphaned_pod_of"] == "dead-c"
+    assert rest.deleted == ["o1"]
+    # this round's delete was unverified, so the entry survives...
+    assert [e["cluster_id"] for e in clumod._ledger_load()] == ["dead-c"]
+    # ...and the next round finds every pod dead and prunes it
+    assert asyncio.run(clumod.gc_clusters(_FAR)) == []
+    assert clumod._ledger_load() == []
 
-        async def list_pods(self):
-            return [
-                {"id": "member", "name": "n0", "clusterId": "live-c"},   # cluster alive
-                {"id": "orphan", "name": "n1", "clusterId": "dead-c"},   # cluster gone
-                {"id": "plain", "name": "n2"},                            # not a cluster pod
-            ]
 
-        async def delete_pod(self, pid):
-            deleted.append(pid)
+def test_gc_ledger_sweep_dry_run_touches_nothing(monkeypatch):
+    rest = _GcRest(alive={"o1"})
+    clumod = _patch_gc(monkeypatch, _GcGql([_LIVE_C]), rest)
+    clumod._ledger_record("dead-c", ["o1"], "gone")
 
-    monkeypatch.setattr(clumod, "RunpodGraphQL", _Gql)
-    monkeypatch.setattr(clumod, "RunpodRest", _Rest)
-    # threshold far in the future so the live cluster itself is not reaped
-    reaped = asyncio.run(clumod.gc_clusters(timedelta(hours=10_000)))
-    assert [r["id"] for r in reaped] == ["orphan"] and deleted == ["orphan"]
+    reaped = asyncio.run(clumod.gc_clusters(_FAR, dry_run=True))
+    assert [r["id"] for r in reaped] == ["o1"] and rest.deleted == []
+    assert [e["cluster_id"] for e in clumod._ledger_load()] == ["dead-c"]
+
+
+def test_gc_ledger_skips_live_clusters(monkeypatch):
+    rest = _GcRest(alive={"m1"})
+    clumod = _patch_gc(monkeypatch, _GcGql([_LIVE_C]), rest)
+    clumod._ledger_record("live-c", ["m1"], "live")
+
+    assert asyncio.run(clumod.gc_clusters(_FAR)) == []
+    assert rest.deleted == []
+    assert [e["cluster_id"] for e in clumod._ledger_load()] == ["live-c"]
+
+
+def test_gc_adopts_survivors_of_reaped_cluster(monkeypatch):
+    # An age-reaped cluster whose deleteCluster orphans a pod: the survivor is
+    # written to the ledger (even though this machine never created it), so
+    # the next gc round can finish the job after the cluster object is gone.
+    old = {"id": "old-c", "name": "old", "createdAt": "2026-08-01T00:00:00Z",
+           "gpuTypeId": "NVIDIA H200", "podCount": 1, "pods": [{"id": "s1"}]}
+    rest = _GcRest(alive={"s1"}, undeletable={"s1"})
+    clumod = _patch_gc(monkeypatch, _GcGql([old]), rest)
+    monkeypatch.setattr(asyncio, "sleep", _no_sleep)
+
+    reaped = asyncio.run(clumod.gc_clusters(timedelta(0)))
+    assert [r["id"] for r in reaped] == ["old-c"]
+    entries = clumod._ledger_load()
+    assert entries[0]["cluster_id"] == "old-c" and entries[0]["pod_ids"] == ["s1"]
+
+
+def test_gc_linkage_fallback_still_reaps_when_rest_reports_it(monkeypatch):
+    # Belt-and-braces: live probes show REGULAR pods have no cluster field,
+    # but member pods might. If REST ever does report linkage, orphans are
+    # reaped even with an empty ledger (e.g. created from another machine).
+    rest = _GcRest(alive={"member", "orphan", "plain"},
+                   linkage={"member": "live-c", "orphan": "dead-c"})
+    clumod = _patch_gc(monkeypatch, _GcGql([_LIVE_C]), rest)
+
+    reaped = asyncio.run(clumod.gc_clusters(_FAR))
+    assert [r["id"] for r in reaped] == ["orphan"] and rest.deleted == ["orphan"]
     assert reaped[0]["orphaned_pod_of"] == "dead-c"
 
-    deleted.clear()
-    reaped = asyncio.run(clumod.gc_clusters(timedelta(hours=10_000), dry_run=True))
-    assert [r["id"] for r in reaped] == ["orphan"] and deleted == []
+    rest.deleted.clear()
+    rest.alive.add("orphan")
+    reaped = asyncio.run(clumod.gc_clusters(_FAR, dry_run=True))
+    assert [r["id"] for r in reaped] == ["orphan"] and rest.deleted == []
+
+
+# ---- ledger lifecycle through the cluster() context manager -----------------
+
+def _patch_cm(monkeypatch, clumod, create_reply, delete_result):
+    """Stub everything around cluster() so only its ledger handling is real."""
+
+    class _Noop:
+        def __init__(self, api_key=None):
+            pass
+
+        async def aclose(self):
+            pass
+
+    class _P:
+        def __init__(self, rest, pid, cfg):
+            self.id, self.config = pid, cfg
+
+        async def _wait_provision(self):
+            pass
+
+        async def _wait_ready(self):
+            pass
+
+    async def _create(gql, config):
+        return create_reply
+
+    deletes = []
+
+    async def _delete(gql, rest, cid, pids):
+        deletes.append((cid, list(pids)))
+        return list(delete_result)
+
+    async def _discover(pods):
+        return pods, {i: f"10.65.0.{i + 2}" for i in range(len(pods))}
+
+    monkeypatch.setattr(clumod, "RunpodGraphQL", _Noop)
+    monkeypatch.setattr(clumod, "RunpodRest", _Noop)
+    monkeypatch.setattr(clumod, "Pod", _P)
+    monkeypatch.setattr(clumod, "_create_with_bid", _create)
+    monkeypatch.setattr(clumod, "_delete_cluster", _delete)
+    monkeypatch.setattr(clumod, "_discover_ranks", _discover)
+    return deletes
+
+
+def test_cluster_cm_records_at_birth_and_forgets_on_clean_teardown(tmp_path, monkeypatch):
+    import importlib
+
+    clumod = importlib.import_module("bellhop.cluster")
+    deletes = _patch_cm(monkeypatch, clumod,
+                        {"id": "c9", "pods": [{"id": "x"}, {"id": "y"}]}, [])
+    inside = {}
+
+    async def _run():
+        async with clumod.cluster(_cfg(tmp_path)):
+            inside["entries"] = clumod._ledger_load()
+
+    asyncio.run(_run())
+    assert inside["entries"][0]["cluster_id"] == "c9"
+    assert inside["entries"][0]["pod_ids"] == ["x", "y"]
+    assert deletes == [("c9", ["x", "y"])]
+    assert clumod._ledger_load() == []       # zero survivors → entry dropped
+
+
+def test_cluster_cm_narrows_ledger_to_teardown_survivors(tmp_path, monkeypatch):
+    import importlib
+
+    clumod = importlib.import_module("bellhop.cluster")
+    _patch_cm(monkeypatch, clumod,
+              {"id": "c9", "pods": [{"id": "x"}, {"id": "y"}]}, ["y"])
+
+    async def _run():
+        async with clumod.cluster(_cfg(tmp_path)):
+            pass
+
+    asyncio.run(_run())
+    entries = clumod._ledger_load()
+    assert entries[0]["cluster_id"] == "c9" and entries[0]["pod_ids"] == ["y"]
